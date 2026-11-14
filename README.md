@@ -46,7 +46,11 @@ Linux x86-64、Python 3.11、CUDA 12.8 和 C/C++ 构建工具。四张 Actor 卡
 - `PARENT`：同一个 8B checkpoint-550，HF 权重、tokenizer、processor、`trainer_state.json`。不是原始基模、2B 或只有 ZeRO 状态的目录。
 - `ROUTE_DATA`：复审封版目录 `route_sft_6g2b_final_v3_reviewed`，必须包含 `manifest.json`、`train.jsonl`、`batches.jsonl`，与代码分开交付。仓库只接受该包的 SHA；旧 v2 不兼容。若此前用 v2 启动过训练，请用新的 `WORK` 目录，不要跨数据版本续训。`check-route` 核对文件 SHA、真实 tokenizer 输入和解码，不占卡、不调用 API。
 
+权重和 v3 训练包不在公开 Git 仓库内。请从实验交接取得这两个输入，并放在运行机器能访问的目录。用 [父模型 SHA 清单](configs/cold_start_sha256.json)确认是当初采集轨迹的那份 550 步权重；重新训练到同一步并不能保证逐文件 SHA 一致。
+
 ```bash
+git clone https://github.com/leiye302/genevolve-8b-rethink-a100-4x.git
+cd genevolve-8b-rethink-a100-4x
 bash scripts/setup.sh
 source .venv/bin/activate
 export WORK=/path/to/independent-run
@@ -54,8 +58,6 @@ export PARENT=/path/to/genevolve-8b-sft/checkpoint-550
 export ROUTE_DATA=/path/to/route_sft_6g2b_final_v3_reviewed
 # 使用自己的四张获配 GPU；由调度器指定时保持它的映射。
 python run.py check-route --parent "$PARENT" --data "$ROUTE_DATA"
-python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"
-python run.py --work "$WORK" prepare
 ```
 
 二阶段和评测需要 Serper + 基线 Judge；仅方法训练额外需要局部 hint API（`glm-5.3-flash`、低思考、HTTPS OpenAI-compatible chat completions；OpenCode Go 每条轨迹使用独立会话 ID）。先确认服务商允许接收训练轨迹。hint 请求只带本条 rollout 的文本证据和指定步号，不带真值图或本地图片路径。凭据通过环境注入，不写进 Git 或命令行。详见 [环境变量模板](configs/services.env.example)。
@@ -67,9 +69,13 @@ read -rsp 'Serper key: ' SERPER_API_KEY; printf '\n'
 read -rsp 'Judge key: ' JUDGE_API_KEY; printf '\n'
 read -rsp 'Hint key: ' GENEVOLVE_HINT_API_KEY; printf '\n'
 export SERPER_API_KEY JUDGE_API_KEY GENEVOLVE_HINT_API_KEY
-python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"
-python run.py --work "$WORK" eval --policy "$WORK/rethink/final" --split bench
+# 准备官方数据 → 一阶段 Route-SFT → 核验 594 步导出 → 二阶段
+python run.py --work "$WORK" all --parent "$PARENT" --data "$ROUTE_DATA"
+# 可选独立终评；或在 all 命令末尾加 --eval，训练完成后自动做全量终评。
+python run.py --work "$WORK" eval --split bench
 ```
+
+只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"`。重新执行 `all` 会复用已验收的官方数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
 
 同 8B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，写入 `WORK/grpo`，不调用 hint API。GenEvolve 的 GRPO+SDL 仍在独立对照仓库。原冷启动和 Route-SFT 两轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启训练使用原命令、同一 WORK、数据、起点、计划步数与服务配置；方法二阶段只接受两轮完成且通过 SHA 检查的 Route-SFT 导出。逐步指标、rollout、运行清单与续训状态保留在 WORK。
 

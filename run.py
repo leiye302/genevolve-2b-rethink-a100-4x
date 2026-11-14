@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from genevolve_repro.common import ROOT, WORLD_SIZE, required_env
+from genevolve_repro.common import ROOT, WORLD_SIZE, load_upstream, required_env
 from genevolve_repro.sft_export import export_files, sft_manifest
 
 
@@ -31,20 +31,76 @@ def eval_flags(parser):
     parser.add_argument("--max-cases", type=int, help="Limit a live evaluation for a pilot")
 
 
+def check_rethink_services():
+    from genevolve_repro.hints import settings_from_env
+
+    required_env("SERPER_API_KEY")
+    required_env("JUDGE_API_KEY")
+    settings_from_env()
+
+
+def validate_steps(steps):
+    if steps is not None and steps < 1:
+        raise ValueError("--steps must be positive.")
+
+
+def run_pipeline(args, work):
+    """Run the two method stages under the caller's single work-directory lock."""
+    from genevolve_repro.data import prepare, verify_data
+    from genevolve_repro.route_data import pack_manifest, recipe
+    from genevolve_repro.runtime import preflight
+
+    validate_steps(args.steps)
+    check_rethink_services()
+    load_upstream()
+    cfg = recipe()
+    parent = args.parent.resolve()
+    data = args.data.resolve()
+    export_files(parent)
+    pack_manifest(data, cfg)
+    total = cfg["batches_per_epoch"] * cfg["epochs"]
+    route_export = work / "route_sft" / f"hf-step-{total:05d}"
+    route_ready = all((route_export / name).is_file() for name in ("completed.json", "export_sha256.json"))
+    if not route_ready:
+        preflight("route-sft", work)
+
+    # Avoid contacting the dataset host on resume if the pinned data and
+    # paired reference images are already available in this work directory.
+    try:
+        verify_data(work)
+    except (ValueError, FileNotFoundError):
+        prepare(work)
+
+    if not route_ready:
+        print(f"Stage 1: Route-SFT ({total} updates)", flush=True)
+        distributed("_route-sft", work, "--parent", str(parent), "--data", str(data))
+    else:
+        print("Stage 1: found existing Route-SFT export; checking handoff", flush=True)
+    print("Stage 2: GenEvolve GRPO + Actor-routed OPSD", flush=True)
+    # The same handoff as the standalone subcommand also validates the
+    # checkpoint on repeat invocations before any stage-2 workers start.
+    execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps), work)
+    if args.eval:
+        print("Final evaluation: GenEvolve-Bench (594 cases)", flush=True)
+        execute(argparse.Namespace(command="eval", split="bench", max_cases=None,
+                                   policy=work / "rethink" / "final"), work)
+
+
 def execute(args, work):
+    if args.command == "all":
+        run_pipeline(args, work)
+        return
     if args.command in {"grpo", "rethink"}:
         export_files(args.sft_checkpoint)
-        if args.steps is not None and args.steps < 1:
-            raise ValueError("--steps must be positive.")
-    if args.command in {"grpo", "rethink", "eval"}:
+        validate_steps(args.steps)
+    if args.command in {"grpo", "eval"}:
         keys = ("WISE_API_KEY",) if getattr(args, "split", None) == "wise" else ("JUDGE_API_KEY",)
         for key in ("SERPER_API_KEY", *keys):
             required_env(key)
     if args.command == "rethink":
-        from genevolve_repro.hints import settings_from_env
         from genevolve_repro.route_sft import verify_route_export
 
-        settings_from_env()
+        check_rethink_services()
         verify_route_export(args.sft_checkpoint.resolve())
     if args.command == "prepare":
         from genevolve_repro.data import prepare
@@ -86,6 +142,10 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
     sft_flag(commands.add_parser("check-sft", help="check and fingerprint an existing SFT export"))
+    pipeline = commands.add_parser("all", help="prepare data and run both method stages")
+    route_flags(pipeline)
+    pipeline.add_argument("--steps", type=int, help="planned stage-2 updates (default: 322, same as the baselines)")
+    pipeline.add_argument("--eval", action="store_true", help="also score the final policy on the full benchmark")
     for name in ("check-route", "route-sft", "_route-sft"):
         route_flags(commands.add_parser(name))
     for name in ("grpo", "_grpo", "rethink", "_rethink"):
