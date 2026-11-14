@@ -1,6 +1,6 @@
 {
-  "schema": "genevolve-route-sft-6g2b-v2",
-  "manifest_sha256": "8dfce78bcbbad95e9e5dfa438dde0de2d9d7a9b71cae9c91b90b59470b61044f",
+  "schema": "genevolve-route-sft-6g2b-v3",
+  "manifest_sha256": "9cca0d451dda83c4194920a34e96fd5476f84845323b99c893a00d0ff096d464",
   "parent_step": 550,
   "world_size": 4,
   "micro_batch": 1,

@@ -44,14 +44,14 @@ Linux x86-64、Python 3.11、CUDA 12.8 和 C/C++ 构建工具。四张 Actor 卡
 运行方提供两个独立输入，不从作者机器读取：
 
 - `PARENT`：同一个 8B checkpoint-550，HF 权重、tokenizer、processor、`trainer_state.json`。不是原始基模、2B 或只有 ZeRO 状态的目录。
-- `ROUTE_DATA`：封版 Route-SFT v2 的 `manifest.json`、`train.jsonl`、`batches.jsonl`，与代码分开交付；`check-route` 查验文件 SHA 及真实 tokenizer 输入和解码，不占卡、不调用 API。
+- `ROUTE_DATA`：复审封版目录 `route_sft_6g2b_final_v3_reviewed`，必须包含 `manifest.json`、`train.jsonl`、`batches.jsonl`，与代码分开交付。仓库只接受该包的 SHA；旧 v2 不兼容。若此前用 v2 启动过训练，请用新的 `WORK` 目录，不要跨数据版本续训。`check-route` 核对文件 SHA、真实 tokenizer 输入和解码，不占卡、不调用 API。
 
 ```bash
 bash scripts/setup.sh
 source .venv/bin/activate
 export WORK=/path/to/independent-run
 export PARENT=/path/to/genevolve-8b-sft/checkpoint-550
-export ROUTE_DATA=/path/to/route-sft-v2
+export ROUTE_DATA=/path/to/route_sft_6g2b_final_v3_reviewed
 # 使用自己的四张获配 GPU；由调度器指定时保持它的映射。
 python run.py check-route --parent "$PARENT" --data "$ROUTE_DATA"
 python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"

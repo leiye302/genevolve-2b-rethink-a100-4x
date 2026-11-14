@@ -75,7 +75,8 @@ def sft_flag(parser):
 
 
 def route_flags(parser):
-    parser.add_argument("--data", required=True, type=Path, help="sealed Route-SFT v2 pack")
+    parser.add_argument("--data", required=True, type=Path,
+                        help="sealed Route-SFT directory (manifest.json, train.jsonl, batches.jsonl)")
     parser.add_argument("--parent", required=True, type=Path, help="matching original SFT checkpoint-550 export")
 
 

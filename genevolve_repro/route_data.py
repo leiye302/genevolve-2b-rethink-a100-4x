@@ -23,7 +23,7 @@ def require(condition, message):
 
 def pack_manifest(folder, cfg):
     path = Path(folder) / "manifest.json"
-    require(path.is_file(), "Expected the sealed Route-SFT v2 manifest.")
+    require(path.is_file(), f"Expected manifest.json for the sealed {cfg['schema']} pack.")
     require(file_sha256(path) == cfg["manifest_sha256"], "Route-SFT manifest SHA-256 mismatch.")
     m = read_json(path)
     for key, expected in {
