@@ -1,4 +1,4 @@
-"""Four-rank Route-SFT over exact captured Qwen3-VL-8B token streams."""
+"""Four-rank Qwen3-VL-2B Route-SFT on the reviewed v3 examples."""
 
 from contextlib import nullcontext
 import random
@@ -16,7 +16,8 @@ from .distributed import (
 )
 from .policy import ActorScorer
 from .route_data import (
-    MARKER_ID, cold_start_lock, load_pack, pack_manifest, recipe, register_marker, route_identity, verify_parent,
+    MARKER_ID, load_pack, pack_manifest, parent_tokenizer, recipe, register_marker,
+    route_identity, source_checkpoint_lock, verify_parent, verify_parent_identity, verify_tokenizer,
 )
 from .sft_export import sft_manifest
 
@@ -104,15 +105,18 @@ def run_epoch_export(out, step, actor, parent, rank, contract):
     barrier()
 
 
-def verify_route_export(path, cfg=None):
+def verify_route_export(path, cfg=None, expected_contract=None):
     cfg = cfg or recipe()
     total = cfg["batches_per_epoch"] * cfg["epochs"]
     done = read_json(path / "completed.json") if (path / "completed.json").is_file() else {}
     identity = done.get("contract") or {}
     if (done.get("algorithm") != "route-sft" or done.get("step") != total
             or identity.get("config") != cfg or identity.get("manifest_sha256") != cfg["manifest_sha256"]
-            or identity.get("parent_sha256") != cold_start_lock()):
+            or identity.get("route_data_source_sha256") != source_checkpoint_lock()):
         raise ValueError("Stage 2 must start from the complete two-epoch Route-SFT HF export.")
+    verify_parent_identity(identity.get("parent"), cfg)
+    if expected_contract is not None and identity != expected_contract:
+        raise ValueError("Route-SFT export does not match the supplied 2B parent and v3 pack; use a new WORK.")
     receipt = read_json(path / "export_sha256.json") if (path / "export_sha256.json").is_file() else {}
     manifest = sft_manifest(path)
     if not receipt or manifest != receipt:
@@ -125,11 +129,14 @@ def _loop(work, parent, data, rank, size, device):
 
     cfg = recipe()
     m = pack_manifest(data, cfg)
-    if rank == 0:
-        verify_parent(parent, m, cfg)
-    barrier()
+    parent_id = gather(verify_parent(parent, cfg) if rank == 0 else None)[0]
     rows, batches = load_pack(data, cfg, m)
-    contract = route_identity(data, m, cfg)
+    # The pack was captured by 8B. Replay its exact IDs only after checking
+    # the actual 2B training parent's tokenizer, not just the public base.
+    if rank == 0:
+        verify_tokenizer(rows, parent_tokenizer(parent))
+    barrier()
+    contract = route_identity(data, m, cfg, parent_id)
     out = work / "route_sft"
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ import run
 from genevolve_repro.common import BENCH, RL, ROOT, WORLD_SIZE, read_json, source_lock, write_json
 from genevolve_repro.data import prepare
 from genevolve_repro.objectives import advantages, grpo_loss, kl_reward
+from genevolve_repro.route_data import verify_parent
 from genevolve_repro.sft_export import TEXT_SIGNATURE, export_files, sft_manifest
 
 
@@ -63,8 +64,10 @@ class ContractTest(unittest.TestCase):
                 export_files(folder)
             fake_export(folder)
             write_json(folder / "config.json",
-                       {"model_type": "qwen3_vl", "text_config": {**TEXT_SIGNATURE, "hidden_size": 2048}})
-            with self.assertRaisesRegex(ValueError, "matched Qwen3-VL-8B"):
+                       {"model_type": "qwen3_vl", "text_config": {
+                           **TEXT_SIGNATURE, "hidden_size": 4096, "num_hidden_layers": 36,
+                       }})
+            with self.assertRaisesRegex(ValueError, "matched Qwen3-VL-2B"):
                 export_files(folder)
             write_json(folder / "config.json", {"model_type": "qwen3_vl", "text_config": TEXT_SIGNATURE})
             write_json(folder / "model.safetensors.index.json",
@@ -75,6 +78,15 @@ class ContractTest(unittest.TestCase):
                        {"weight_map": {"example": "../model.safetensors"}})
             with self.assertRaisesRegex(ValueError, "local safetensors shards"):
                 export_files(folder)
+
+    def test_parent_requires_step_550_in_addition_to_the_2b_shape(self):
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "parent"
+            fake_export(path)
+            self.assertEqual(verify_parent(path), sft_manifest(path))
+            write_json(path / "trainer_state.json", {"global_step": 549})
+            with self.assertRaisesRegex(ValueError, "SFT checkpoint-550"):
+                verify_parent(path)
 
     def test_prepare_downloads_only_matched_rl_and_bench(self):
         with TemporaryDirectory() as temp:

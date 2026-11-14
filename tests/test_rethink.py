@@ -14,7 +14,7 @@ from genevolve_repro.common import ROOT, read_json, write_json
 from genevolve_repro.evolve import update_actor
 from genevolve_repro.evaluate import evaluate_case
 from genevolve_repro.policy import Turn, Trajectory
-from genevolve_repro.route_data import MARKER_ID, cold_start_lock, recipe
+from genevolve_repro.route_data import MARKER_ID, recipe, source_checkpoint_lock, verify_parent
 from genevolve_repro.route_sft import RouteScorer, verify_route_export
 from genevolve_repro.sft_export import sft_manifest
 from test_contract import fake_export
@@ -219,14 +219,22 @@ class RethinkTest(unittest.TestCase):
         cfg = recipe()
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "route"
+            parent = Path(tmp) / "parent"
+            fake_export(parent)
             fake_export(path)
             with self.assertRaisesRegex(ValueError, "two-epoch"):
                 verify_route_export(path)
-            write_json(path / "completed.json", {"step": 594, "algorithm": "route-sft",
-                       "contract": {"config": cfg, "manifest_sha256": cfg["manifest_sha256"],
-                                    "parent_sha256": cold_start_lock()}})
+            identity = {
+                "config": cfg, "manifest_sha256": cfg["manifest_sha256"],
+                "route_data_source_sha256": source_checkpoint_lock(),
+                "parent": verify_parent(parent),
+            }
+            write_json(path / "completed.json", {"step": 594, "algorithm": "route-sft", "contract": identity})
             write_json(path / "export_sha256.json", sft_manifest(path))
-            self.assertEqual(verify_route_export(path)["completed"]["step"], 594)
+            self.assertEqual(verify_route_export(path, expected_contract=identity)["completed"]["step"], 594)
+            (parent / "model.safetensors").write_bytes(b"a different step 550 export")
+            with self.assertRaisesRegex(ValueError, "supplied 2B parent"):
+                verify_route_export(path, expected_contract={**identity, "parent": verify_parent(parent)})
             (path / "model.safetensors").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 verify_route_export(path)

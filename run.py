@@ -47,7 +47,7 @@ def validate_steps(steps):
 def run_pipeline(args, work):
     """Run the two method stages under the caller's single work-directory lock."""
     from genevolve_repro.data import prepare, verify_data
-    from genevolve_repro.route_data import pack_manifest, recipe
+    from genevolve_repro.route_data import pack_manifest, recipe, route_identity, verify_parent
     from genevolve_repro.runtime import preflight
 
     validate_steps(args.steps)
@@ -56,8 +56,8 @@ def run_pipeline(args, work):
     cfg = recipe()
     parent = args.parent.resolve()
     data = args.data.resolve()
-    export_files(parent)
-    pack_manifest(data, cfg)
+    pack = pack_manifest(data, cfg)
+    contract = route_identity(data, pack, cfg, verify_parent(parent, cfg))
     total = cfg["batches_per_epoch"] * cfg["epochs"]
     route_export = work / "route_sft" / f"hf-step-{total:05d}"
     route_ready = all((route_export / name).is_file() for name in ("completed.json", "export_sha256.json"))
@@ -79,7 +79,8 @@ def run_pipeline(args, work):
     print("Stage 2: GenEvolve GRPO + Actor-routed OPSD", flush=True)
     # The same handoff as the standalone subcommand also validates the
     # checkpoint on repeat invocations before any stage-2 workers start.
-    execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps), work)
+    execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps,
+                               route_contract=contract), work)
     if args.eval:
         print("Final evaluation: GenEvolve-Bench (594 cases)", flush=True)
         execute(argparse.Namespace(command="eval", split="bench", max_cases=None,
@@ -101,7 +102,7 @@ def execute(args, work):
         from genevolve_repro.route_sft import verify_route_export
 
         check_rethink_services()
-        verify_route_export(args.sft_checkpoint.resolve())
+        verify_route_export(args.sft_checkpoint.resolve(), expected_contract=getattr(args, "route_contract", None))
     if args.command == "prepare":
         from genevolve_repro.data import prepare
         prepare(work)
@@ -127,17 +128,17 @@ def execute(args, work):
 
 def sft_flag(parser):
     parser.add_argument("--sft-checkpoint", required=True, type=Path,
-                        help="Qwen3-VL-8B HF export; Route-SFT final for rethink, original SFT-550 for GRPO")
+                        help="Qwen3-VL-2B HF export; Route-SFT final for rethink, baseline SFT-550 for GRPO")
 
 
 def route_flags(parser):
     parser.add_argument("--data", required=True, type=Path,
                         help="sealed Route-SFT directory (manifest.json, train.jsonl, batches.jsonl)")
-    parser.add_argument("--parent", required=True, type=Path, help="matching original SFT checkpoint-550 export")
+    parser.add_argument("--parent", required=True, type=Path, help="matching GenEvolve 2B SFT checkpoint-550 HF export")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenEvolve 8B Route-SFT and Actor-routed OPSD on four GPUs")
+    parser = argparse.ArgumentParser(description="GenEvolve 2B Route-SFT and Actor-routed OPSD on four GPUs")
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
@@ -162,21 +163,22 @@ def main():
         except ValueError as error:
             parser.error(str(error))
     elif args.command == "check-route":
-        from transformers import AutoTokenizer
-
         from genevolve_repro.route_data import (
-            load_pack, pack_manifest, recipe, register_marker, verify_parent, verify_tokenizer,
+            load_pack, pack_manifest, parent_tokenizer, recipe, verify_parent, verify_tokenizer,
         )
 
         cfg = recipe()
-        m = pack_manifest(args.data.resolve(), cfg)
-        verify_parent(args.parent.resolve(), m, cfg)
-        rows, batches = load_pack(args.data.resolve(), cfg, m)
-        tokenizer = register_marker(AutoTokenizer.from_pretrained(args.parent.resolve(), local_files_only=True))
-        verify_tokenizer(rows, tokenizer)
-        print(json.dumps({"rows": len(rows), "batches": len(batches), "updates": len(batches) * cfg["epochs"],
-                          "max_tokens": max(map(lambda row: len(row["input_ids"]), rows)),
-                          "all_online_prefixes_matched": True}, indent=2))
+        try:
+            m = pack_manifest(args.data.resolve(), cfg)
+            parent = verify_parent(args.parent.resolve(), cfg)
+            rows, batches = load_pack(args.data.resolve(), cfg, m)
+            verify_tokenizer(rows, parent_tokenizer(args.parent.resolve()))
+            print(json.dumps({"parent": parent, "trajectory_source": "8B",
+                              "rows": len(rows), "batches": len(batches), "updates": len(batches) * cfg["epochs"],
+                              "max_tokens": max(len(row["input_ids"]) for row in rows),
+                              "all_online_prefixes_matched": True}, indent=2))
+        except (ValueError, FileNotFoundError) as error:
+            parser.error(str(error))
     elif args.command == "_route-sft":
         from genevolve_repro.route_sft import worker
         worker(work, args.parent.resolve(), args.data.resolve())

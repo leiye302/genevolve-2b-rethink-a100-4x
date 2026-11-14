@@ -2,10 +2,11 @@
 
 from collections import Counter
 from pathlib import Path
+import re
 
 from .actor_text import ACTOR_TEXT_PROTOCOL, decode_actor_response
 from .common import ROOT, jsonl, read_json
-from .sft_export import export_files, file_sha256
+from .sft_export import MODEL_FAMILY, REQUIRED, file_sha256, sft_manifest
 
 MARKER = "<RETHINK>"
 MARKER_ID = 151669
@@ -35,28 +36,33 @@ def pack_manifest(folder, cfg):
         "history_truncation": False, "official_split_overlap_exact_normalized": 0,
     }.items():
         require(m.get(key) == expected, f"Unexpected Route-SFT manifest field: {key}.")
-    require(m["checkpoint550_file_sha256"] == cold_start_lock(),
-            "Route-SFT and comparison cold-start identities disagree.")
+    require(m["checkpoint550_file_sha256"] == source_checkpoint_lock(),
+            "Route-SFT collection provenance does not match the sealed 8B source.")
     return m
 
 
-def cold_start_lock():
-    return read_json(ROOT / "configs" / "cold_start_sha256.json")
+def source_checkpoint_lock():
+    """The weights that generated the v3 examples, not the 2B training start."""
+    return read_json(ROOT / "configs" / "route_data_source_8b_sha256.json")
 
 
-def verify_parent(parent, manifest=None, cfg=None):
-    parent = Path(parent)
+def verify_parent_identity(identity, cfg=None):
     cfg = cfg or recipe()
-    exported = set(export_files(parent))
-    locked = manifest["checkpoint550_file_sha256"] if manifest is not None else cold_start_lock()
-    require(exported <= set(locked), "Parent HF export contains unlocked model/tokenizer files.")
-    for name, expected in locked.items():
-        path = parent / name
-        require(path.is_file() and file_sha256(path) == expected, f"Parent SHA-256 mismatch: {name}.")
-    require(read_json(parent / "trainer_state.json").get("global_step") == cfg["parent_step"],
-            "Expected the exact GenEvolve SFT checkpoint-550.")
-    return {"model_family": "Qwen3-VL-8B-Instruct", "sft_global_step": cfg["parent_step"],
-            "sha256": locked}
+    require(isinstance(identity, dict)
+            and identity.get("model_family") == MODEL_FAMILY
+            and identity.get("sft_global_step") == cfg["parent_step"],
+            f"Expected a {MODEL_FAMILY} GenEvolve SFT checkpoint-{cfg['parent_step']}.")
+    hashes = identity.get("sha256")
+    require(isinstance(hashes, dict) and set(REQUIRED) <= hashes.keys()
+            and any(name.endswith(".safetensors") for name in hashes)
+            and all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value)
+                    for value in hashes.values()),
+            "Incomplete 2B parent fingerprint.")
+    return identity
+
+
+def verify_parent(parent, cfg=None):
+    return verify_parent_identity(sft_manifest(parent), cfg)
 
 
 def load_pack(folder, cfg, manifest=None):
@@ -129,6 +135,19 @@ def verify_tokenizer(rows, tokenizer):
     """Compare the online chat template and decode boundary, not just the stored labels."""
     from .policy import tokenize_history
 
+    class DecodeView:
+        # The shared decoder does not modify the tokenizer. Cache its vocabulary
+        # locally for the exhaustive preflight instead of rebuilding it per row.
+        all_special_ids = tokenizer.all_special_ids
+
+        def get_vocab(self):
+            return vocabulary
+
+        def decode(self, *args, **kwargs):
+            return tokenizer.decode(*args, **kwargs)
+
+    vocabulary = tokenizer.get_vocab()
+    view = DecodeView()
     tail = tokenizer.encode("</think>\n", add_special_tokens=False)
     for j, row in enumerate(rows):
         ids = row["input_ids"]
@@ -137,14 +156,21 @@ def verify_tokenizer(rows, tokenizer):
         require(tokenize_history(tokenizer, row["messages"]) == ids[:end],
                 f"Online template differs from frozen history at row {j}.")
         require(ids[start-len(tail):start] == tail
-                and decode_actor_response(tokenizer, ids[end:]) == row["assistant_prefix"] + row["target"],
+                and decode_actor_response(view, ids[end:]) == row["assistant_prefix"] + row["target"],
                 f"Runtime decoder or masked separator differs at row {j}.")
 
 
-def route_identity(folder, m, cfg):
+def parent_tokenizer(parent):
+    from transformers import AutoTokenizer
+
+    return register_marker(AutoTokenizer.from_pretrained(parent, use_fast=True, local_files_only=True))
+
+
+def route_identity(folder, m, cfg, parent_identity):
     return {
         "config": cfg, "manifest_sha256": file_sha256(Path(folder) / "manifest.json"),
         "artifact_sha256": {name: m["artifact_sha256"][name] for name in ("train.jsonl", "batches.jsonl")},
-        "parent_sha256": m["checkpoint550_file_sha256"],
+        "parent": verify_parent_identity(parent_identity, cfg),
+        "route_data_source_sha256": m["checkpoint550_file_sha256"],
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL,
     }
