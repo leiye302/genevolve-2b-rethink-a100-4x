@@ -1,102 +1,87 @@
-# GenEvolve 2B：SFT → GRPO only（4×A100 80GB）
+# GenEvolve 8B：ReActOPSD（4×A100 80GB）
 
-这是 [GenEvolve-2B-Reproduction 的配对消融](https://github.com/leiye302/GenEvolve-2B-Reproduction/tree/67f58aaa6c4324739a5da6cd78b8a33021cb41aa)，不是作者发布的 8B 模型或训练入口。复用同一 **Qwen3-VL-2B-Instruct SFT 导出**，从二阶段开始，只做在线 GRPO。保留官方三种工具、静态知识技能、渲染器、图像与程序奖励、参考策略 KL、采样设置和评测。删除视觉经验提取、检索/记忆、特权 Teacher 和 SDL；不需要经验模型，也没有新增 RETHINK 或 OPSD。
+在 **Qwen3-VL-8B-Instruct 的原版 GenEvolve SFT checkpoint-550** 后接两轮 Route-SFT，再接原 GenEvolve 的 GRPO 与本方法的 Actor-routed OPSD。不重新做冷启动 SFT，不改原生工具、反馈、渲染或评分。
 
-[GenEvolve 论文](https://arxiv.org/html/2605.21605v2) · [作者工具和评分代码](https://github.com/MeiGen-AI/GenEvolve/tree/23c847c559ccc0f95bbf4b3d8925898463822f4c) · [固定版本](sources.json)
+对照来源：[GRPO](https://github.com/leiye302/genevolve-2b-grpo-a100-4x/tree/2f197591100d8b0bf61e65be9748a0752f91ae30) · [GenEvolve 自进化](https://github.com/leiye302/GenEvolve-2B-Reproduction/tree/57263f0583c633c3d515913b9935c3850cdf798e) · [8B 原版 SFT](https://github.com/leiye302/genevolve-stage1-a100-4x/tree/a3b769994bf3d1b422a6ffd3cdf9d62418dd98ec) · [作者代码](https://github.com/MeiGen-AI/GenEvolve/tree/23c847c559ccc0f95bbf4b3d8925898463822f4c)。前两个公开入口默认是 **2B**；如果基线已在运行机器上切到 8B，应按有效配置和起点文件 SHA 验收。不能直接拿 2B 结果作为 8B 对照。
 
-## 启动
+## 与对照组共用的设置
 
-在分配好的四卡 Linux x86-64 训练机上使用 Python 3.11、CUDA 12.8 toolkit、可用的 NVIDIA 驱动及 C/C++ 编译器。四张 A100 80GB 是与对照仓库一致的目标配置；实际显存峰值以目标机试跑为准。渲染模型缓存、图片和可续训断点都要留盘。保留对照仓库的 FSDP 和 CPU offload 设置。
+| 项目 | 固定口径 |
+| --- | --- |
+| 冷启动 | 同一原版 8B SFT-550；仅方法组再做 Route-SFT |
+| 数据与 rollout | 固定版本 GenEvolve-Data-RL，训练 2,575 题；seed 42，每步 8 题 × 每题 6 条轨迹，四卡各负责 2 个完整题组 |
+| 采样 | temperature 0.7，top-p 0.95，最多 11 回合／每回合 4,096 新 token，整轨迹 30,000，初始输入 6,144，上下文 65,536 |
+| GRPO | 原组内标准化、0.20/0.28 非对称裁剪、轨迹 KL 惩罚系数 0.001、程序奖励权重 0.5、LR 1e-6、cosine；保留基线 FSDP 布局 |
+| 保存与续训 | 二阶段每 10 步和最后一步存，保留最近两份可续训断点；另导出最终 HF 模型 |
+| 渲染与评分 | 固定 Qwen-Image-Edit-2511，40 步、CFG 4、seed 0、最多两张参考图；基线的 `qwen3.7-flash-2026-07-15` 奖励和 KScore 评审 |
+| 终评 | GenEvolve-Bench 同序 594 题、KScore、原版 prompt fallback；temperature 0.6、top-p 0.9、逐题 seed=42+序号；可选同版 RL-val 600 或 WISE 1000 |
 
-### 1. 安装并指定现有 SFT
+二阶段默认与两个对照入口一样：`ceil(2575 / 8) = 322` updates。传 `--steps N` 可指定配对预算；**三组必须使用相同的计划步数**，因为 cosine 也以该步数为周期。在计划跑 322 步但停于 30 步，与从头设 `--steps 30` 不等价。实际运行长度以每组运行清单为准。
+
+## 一阶段：6 Good + 2 Bad，恰好两轮
+
+封版包共 2,376 条：1,782 Good / 594 Bad。Bad 含 394 条自然错误和 200 条同状态构造对照（与源 Good 同 batch）。Good 保留真实采样动作；Bad 使用原生 `<tool_call>…</tool_call>` 或 `<answer>…</answer>` 纠正后缀，前面加一个注册后的 `<RETHINK>`。训练与 rollout 保持同一文本工具历史，不给 Actor 插入额外图像观察或换解析器。
+
+- mask 至 `</think>\n`（含分隔符），只监督动作后缀及 EOS。用首个目标 token 的预测位置，在**全词表**上算 marker BCE；逐样本平均后缀 CE + 0.1 × BCE，无 reasoning CE、无 KL、无 LoRA。
+- 按原序扫描 297 个固定批次两遍：全局 8，四卡 × micro 1 × 累积 2，**594 updates**。LR 2e-6，前 10% warmup、cosine、AdamW (0.9, 0.95)、weight decay 0.01、clip 1.0、seed 0。语言参数全参训练，视觉塔不动。
+- 最长 11,223 tokens；使用 12,288 上限，超长直接报错，不重分词或截断。每轮存原生可续训状态和 HF 导出。该封版包只供训练，没有另造 SFT val split；日志中的 train loss 和给定前缀 marker 概率不是自由生成指标。
+
+## 二阶段：GRPO + Actor-routed OPSD
+
+完整轨迹做 GRPO。Teacher 是**当前这轮 Actor 的无梯度副本**，评分同一批原始生成 token：
+
+| Actor 的该回合 | Teacher 的额外条件 |
+| --- | --- |
+| 无特殊 token `<RETHINK>` | GenEvolve 通用静态 skill |
+| Actor 生成特殊 token `<RETHINK>` | 同一静态 skill + 该回合的局部 hint；缺失、超长或引用当前未见图像时退回静态 skill |
+
+detach Teacher 和门控 `sigmoid(5 × (logp_teacher − logp_student))`；按有效 token 平均，系数 **0.01**。方法版不叠加对照的 GenEvolve 经验库／top-10% SDL。基线的 frozen reference 只用于原奖励 KL，不是蒸馏 Teacher。局部 API 每条带 marker 的轨迹发一组请求（失败有限重试）；只给指定回合提示，不打 Good/Bad、不替 Actor 执行动作、不做 episode 经验总结。Student、工具、终评均不读 hint。marker 格式和位置只统计，不作为路由门禁。
+
+## 运行
+
+Linux x86-64、Python 3.11、CUDA 12.8 和 C/C++ 构建工具。四张 Actor 卡须空闲。使用同版独立渲染服务，或另开渲染机执行 `bash scripts/setup.sh --renderer`、`bash scripts/serve_renderer.sh`。保留基线 FSDP CPU offload；8B 四副本加载、合并权重及 Adam 状态需较大主内存，建议先确认至少 384 GiB RAM。每阶段约需预留 320 GiB 可用盘空间给续训断点和导出；同盘两阶段要加上已保存的第一阶段文件，数据、渲染模型和生成图片另计。实际峰值尚未在四卡验证。
+
+运行方提供两个独立输入，不从作者机器读取：
+
+- `PARENT`：同一个 8B checkpoint-550，HF 权重、tokenizer、processor、`trainer_state.json`。不是原始基模、2B 或只有 ZeRO 状态的目录。
+- `ROUTE_DATA`：封版 Route-SFT v2 的 `manifest.json`、`train.jsonl`、`batches.jsonl`，与代码分开交付；`check-route` 查验文件 SHA 及真实 tokenizer 输入和解码，不占卡、不调用 API。
 
 ```bash
-git clone https://github.com/leiye302/genevolve-2b-grpo-a100-4x.git
-cd genevolve-2b-grpo-a100-4x
 bash scripts/setup.sh
 source .venv/bin/activate
-
-export WORK=/path/to/new-grpo-run
-export SFT_CHECKPOINT=/path/to/existing-sft-hf-export
-python run.py check-sft --sft-checkpoint "$SFT_CHECKPOINT"
+export WORK=/path/to/independent-run
+export PARENT=/path/to/genevolve-8b-sft/checkpoint-550
+export ROUTE_DATA=/path/to/route-sft-v2
+# 使用自己的四张获配 GPU；由调度器指定时保持它的映射。
+python run.py check-route --parent "$PARENT" --data "$ROUTE_DATA"
+python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"
 python run.py --work "$WORK" prepare
 ```
 
-`SFT_CHECKPOINT` 指向对照实验也会使用的完整 HF 导出，例如原仓库的 `work/sft` 最终目录，或包含相同 HF 文件的 `checkpoint-550`。需要配置、分词器、处理器和全部 safetensors 权重分片。不需要 SFT 优化器；只有 ZeRO-3 原生分片时，请先用原 SFT 工程导出完整 HF 权重，再指向导出目录。`check-sft` 不调用 GPU 或 API，只做结构检查并输出文件 SHA256；可以和方法端输入逐项比对。不会回退到基模。
-
-`prepare` 只下载固定版本的 GenEvolve RL 数据（2,575 训练、600 验证）和 594 题 GenEvolve-Bench，不下载 SFT 数据、基模或 embedding 模型。公开资源版本见 `sources.json`。限流时可自行设置 `HF_TOKEN`，不要提交任何凭据。
-
-### 2. 配置渲染和评分
-
-使用与对照相同的 Qwen-Image-Edit-2511 兼容服务（`POST /generate`）。如果没有现成服务，可在渲染机器运行：
+二阶段和评测需要 Serper + 基线 Judge；仅方法训练额外需要局部 hint API（`glm-5.3-flash`、低思考、HTTPS OpenAI-compatible chat completions；OpenCode Go 每条轨迹使用独立会话 ID）。先确认服务商允许接收训练轨迹。hint 请求只带本条 rollout 的文本证据和指定步号，不带真值图或本地图片路径。凭据通过环境注入，不写进 Git 或命令行。详见 [环境变量模板](configs/services.env.example)。
 
 ```bash
-bash scripts/setup.sh --renderer
-CUDA_VISIBLE_DEVICES=0 bash scripts/serve_renderer.sh --cpu-offload
+export QWEN_SERVICE_URL=http://render-host:8001
+export GENEVOLVE_HINT_API_URL=https://opencode.ai/inference/go/openai/v1/chat/completions
+read -rsp 'Serper key: ' SERPER_API_KEY; printf '\n'
+read -rsp 'Judge key: ' JUDGE_API_KEY; printf '\n'
+read -rsp 'Hint key: ' GENEVOLVE_HINT_API_KEY; printf '\n'
+export SERPER_API_KEY JUDGE_API_KEY GENEVOLVE_HINT_API_KEY
+python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"
+python run.py --work "$WORK" eval --policy "$WORK/rethink/final" --split bench
 ```
 
-本地渲染器使用固定版本的 Qwen-Image-Edit-2511；客户端沿用 40 步、CFG 4.0、seed 0、最多 2 张参考图。同机部署时渲染器会与训练共享显存和 CPU 内存，建议先确认峰值，或沿用已有渲染服务。评审仍是配对仓库的 `qwen3.7-flash-2026-07-15`，关闭思考。请在自己的 shell 中配置 Serper 和百炼 Key：
+同 8B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，写入 `WORK/grpo`，不调用 hint API。GenEvolve 的 GRPO+SDL 仍在独立对照仓库。原冷启动和 Route-SFT 两轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启训练使用原命令、同一 WORK、数据、起点、计划步数与服务配置；方法二阶段只接受两轮完成且通过 SHA 检查的 Route-SFT 导出。逐步指标、rollout、运行清单与续训状态保留在 WORK。
+
+终评在不改分数的前提下另写 `route_telemetry.json`，按决策回合统计原生特殊 marker，并单列位置正确率，不按总 token 数作分母。RL-val 同样记录。
+
+## 离线检查
 
 ```bash
-# 仅在未由调度器指定时，设置为自己实际获配的 4 张卡。
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export QWEN_SERVICE_URL=http://127.0.0.1:8001
-export JUDGE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-read -rsp 'Serper API key: ' SERPER_API_KEY; printf '\n'
-read -rsp 'Model Studio API key: ' JUDGE_API_KEY; printf '\n'
-export SERPER_API_KEY JUDGE_API_KEY
-```
-
-搜索和奖励评分仍消耗 API 额度。这里取消的是经验总结调用，不是奖励 Judge。环境变量模板见 [configs/services.env.example](configs/services.env.example)。
-
-### 3. 只跑二阶段 GRPO
-
-```bash
-python run.py --work "$WORK" grpo --sft-checkpoint "$SFT_CHECKPOINT"
-```
-
-默认与对照仓库一致：每次更新 8 个请求、每个 6 条轨迹（四卡各 2 个完整 group），遍历同一训练集一轮，共 322 次更新。`--steps N` 仅供配对短跑使用；短跑的输出请放在不同的工作目录。中断后用同一命令、同一数据、SFT 导出和总步数重启。续训检查 SFT 文件指纹、训练 JSONL 指纹、配置、Judge、世界大小及训练总步数。
-
-| 路径（相对于 `WORK`） | 产物 |
-| --- | --- |
-| `grpo/contract.json` | 运行配置、SFT SHA256、训练清单 SHA256、公开源版本 |
-| `grpo/rollouts/`、`grpo/metrics/` | 逐步轨迹、渲染图、原始奖励、有效程序比例、GRPO loss、学习率、梯度范数 |
-| `grpo/checkpoint-*/` | 每 10 步及最后一步保存，保留最近两个完整状态，包含模型、优化器、调度器和 RNG |
-| `grpo/final/` | 最终 HF safetensors 导出 |
-
-## 对齐口径
-
-- 生成：seed 42、temperature 0.7、top-p 0.95，最多 11 次模型调用、30,000 个响应 token。沿用原 agent prompt、`search`、`image_search`、`query_knowledge` 和最终 prompt-reference program。
-- 奖励：同一有效程序判定，图像 KScore 和五档程序充分性各占 0.5；无效程序为 0。冻结的同一 SFT 权重只给原采样 token 算 reference log-prob，用于原 GRPO 奖励 KL 惩罚（系数 0.001）；**不是蒸馏 Teacher**。
-- 优化：沿用原不对称裁剪（下 0.20、上 0.28）、按同题组归一化优势、轨迹内 token loss 求和再对轨迹平均、LR 1e-6 及 cosine 调度。相对配对仓库，训练目标只移除 SDL：`GRPO + 2 × SDL → GRPO`。这不是把经验权重置零后仍跑提取和 Teacher；这些路径不在本仓库中。
-
-## 可选评测
-
-训练不会自动发起付费评测。需要比较时，用两边相同的渲染、Judge、seed 和 split。默认全量 GenEvolve-Bench（594 题），`--split rl-val` 为固定的 600 条 RL 验证集。可用 `--policy` 对同一个 SFT 起点评测；小规模 `--max-cases N` 只用于试跑。
-
-```bash
-python run.py --work "$WORK" eval --split bench
-# 可选：评测同一 SFT 起点
-python run.py --work "$WORK" eval --split bench --policy "$SFT_CHECKPOINT"
-```
-
-保留对照仓库的独立 WISE legacy 评测（1,000 题）；仅需要它时运行 `bash scripts/setup.sh --wise-sources`，并配置提供 `gpt-4o-2024-05-13` 的 `WISE_API_KEY`（兼容端点可另设 `WISE_BASE_URL`），再执行 `python run.py --work "$WORK" eval --split wise`。
-
-评测渲染直接调用固定版本的官方 `scripts/generate_images.py`：存在生成指令和至少一条实际存在的参考图路径时，使用 Actor 的方案；否则尝试以原始用户请求、无参考图生成，再按相同评分器评分。绘图后端若不支持无参考图，或生成仍失败，该题仍计零，不重试为另一个方案。逐题结果中的 `program_valid` 单独记录 Actor 原方案的有效性，`render_fallback`／`render_source` 标明是否使用回退，不能把回退生成成功算成 Actor 原方案有效。GenEvolve-Bench、`rl-val` 和 WISE 共用此规则；RL 训练中的无效程序零奖励不变。
-
-评测配置保存渲染协议版本，旧版“无效程序直接计零”的缓存不能与新版混用；请先归档旧评测目录，再重新评测。此修复与[配对方法仓库的评测修复](https://github.com/leiye302/GenEvolve-2B-Reproduction/commit/0c35d1a8cce551887b9afb608afa35ca755e7104)一致；`sources.json` 仍保留原训练配方的对照版本。模型、提示词、采样参数、评审模型、训练数据及 loss 均未因此改变。
-
-## 离线验收
-
-Actor 解码统一由 `genevolve_repro.actor_text.decode_actor_response` 执行，与配对方法仓库采用相同实现：保留已注册的特殊 `<RETHINK>`，其余特殊控制 token 仍按原规则清理。训练 rollout、GenEvolve-Bench、`rl-val` 和 WISE 共用此路径；历史和逐题结果不会再丢掉已经生成的 marker。原始生成 token ID、GRPO loss 和采样配置不变，不新增词表、提示词、Teacher 或 RETHINK 路由算法。普通无 marker 模型的解码保持原样。新 rollout 记录解码版本，旧评测缓存不能与新版混用；请先归档旧评测目录。已有训练进程不会被这个代码更新热切换或重启。
-
-```bash
-GENEVOLVE_PYTHON=python3.11 bash scripts/setup.sh --sources-only
-python3.11 -m venv .venv-smoke
-source .venv-smoke/bin/activate
+bash scripts/setup.sh --sources-only
 python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements-smoke.txt
 python -m unittest discover -s tests -v
 ```
 
-CPU 检查用小模型和模拟服务执行真实 rollout token 评分、奖励、反向传播、断点恢复、导出与评测汇总。Linux CI 另覆盖四 rank FSDP/Gloo；仅在纯 CPU 测试中跳过设备到 CPU 的 offload，CUDA 仍用对照仓库的配置。它们不代表目标机上的四卡 CUDA、对方实际 SFT 文件或真实外部服务已经验证。
+离线检查以 mock 工具、Judge、hint 覆盖 rollout、解码、Teacher 输入、梯度和断点写入。真实 GPU 训练、API 质量和图像评分需在目标机验证。

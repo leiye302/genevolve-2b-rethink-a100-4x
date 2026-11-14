@@ -179,7 +179,9 @@ class PipelineTest(unittest.TestCase):
                 self.assertEqual(judge.call_count, 4)
                 self.assertFalse(torch.equal(old, model.lm_head.weight))
                 scheduler.step()
-                save_checkpoint(folder, actor, optimizer, scheduler, 1, {"algorithm": "grpo"}, 0, torch.device("cpu"))
+                save_checkpoint(folder, actor, optimizer, scheduler, 1, {"algorithm": "grpo"}, 0,
+                                torch.device("cpu"), verify=True)
+                self.assertTrue((latest(folder) / "state_sha256.json").is_file())
                 state = load_checkpoint(latest(folder))
                 resumed = ActorScorer(tiny_policy())
                 resumed.load_state_dict(state["actor"])

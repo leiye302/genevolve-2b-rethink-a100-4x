@@ -5,11 +5,19 @@
   },
   "comparison": {
     "repo": "https://github.com/leiye302/GenEvolve-2B-Reproduction.git",
-    "revision": "67f58aaa6c4324739a5da6cd78b8a33021cb41aa"
+    "revision": "57263f0583c633c3d515913b9935c3850cdf798e"
+  },
+  "grpo": {
+    "repo": "https://github.com/leiye302/genevolve-2b-grpo-a100-4x.git",
+    "revision": "2f197591100d8b0bf61e65be9748a0752f91ae30"
+  },
+  "cold_start": {
+    "repo": "https://github.com/leiye302/genevolve-stage1-a100-4x.git",
+    "revision": "a3b769994bf3d1b422a6ffd3cdf9d62418dd98ec"
   },
   "base": {
-    "repo": "Qwen/Qwen3-VL-2B-Instruct",
-    "revision": "89644892e4d85e24eaac8bacfd4f463576704203"
+    "repo": "Qwen/Qwen3-VL-8B-Instruct",
+    "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
   },
   "data": {
     "repo": "MeiGen-AI/GenEvolve-Data-Bench",

@@ -12,7 +12,7 @@ import torch.distributed as dist
 from .actor_text import ACTOR_TEXT_PROTOCOL
 
 from .common import RL, ROOT, load_upstream, model_ready, read_json, required_env, source_lock, write_json
-from .data import examples
+from .data import examples, verify_split
 from .distributed import (
     copy_actor, export_policy, gather, initialize, latest, load_checkpoint, load_model,
     make_sharded_actor, max_count, restore_optimizer, restore_rng, save_checkpoint,
@@ -20,7 +20,10 @@ from .distributed import (
 from .feedback import LiveFeedback, judge_settings
 from .objectives import advantages, grpo_loss, kl_reward
 from .policy import ActorScorer, make_agent, score_turn
-from .sft_export import file_sha256, sft_manifest
+from .route_data import verify_parent
+from .route_sft import verify_route_export
+from .sft_export import file_sha256
+from . import teacher
 
 
 @dataclass
@@ -56,7 +59,7 @@ def score_reference(groups, scorer, cfg, device):
                 turn.reference = score_turn(scorer, turn.prefix, turn.tokens, cfg["temperature"], device).cpu()
 
 
-def update_actor(actor, optimizer, groups, cfg, device, dummy_id):
+def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, opsd=None):
     # Every rank owns the same number of whole prompt groups. FSDP averages
     # gradients across ranks, so the local sequence denominator is sufficient.
     normalizer = sum(len(group.trajectories) for group in groups)
@@ -73,6 +76,16 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id):
         raise RuntimeError("All trajectories were empty. Check the model and generation budgets.")
     optimizer.zero_grad(set_to_none=True)
     grpo_sum = 0.0
+    if opsd is not None:
+        local_tokens = sum(len(turn.tokens) for turn, _ in jobs if turn.teacher is not None)
+        token_count = torch.tensor(local_tokens, dtype=torch.long, device=device)
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        if world > 1:
+            dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        # FSDP averages gradients. Convert the local sum into the shared
+        # global token mean regardless of turn count, length or API misses.
+        token_scale = world / max(1, int(token_count))
+        distill = torch.zeros(3, device=device)
     for i in range(count):
         # Offloaded FSDP needs no_sync for accumulation. A short dummy turn
         # keeps collective order identical when trajectories end at different times.
@@ -84,6 +97,10 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id):
                 grpo = grpo_loss(new, turn, advantage, cfg)
                 loss = grpo / normalizer
                 grpo_sum += grpo.detach().item()
+                if opsd is not None and turn.teacher is not None:
+                    terms, gate, gap = teacher.sdar_token_terms(new, turn.teacher, opsd["gate_beta"])
+                    loss = loss + opsd["sdar_coef"] * token_scale * terms.sum()
+                    distill += torch.stack((terms.detach().sum(), gate.sum(), gap.sum()))
             else:
                 loss = score_turn(actor, [dummy_id], [dummy_id], cfg["temperature"], device).sum() * 0
             loss.backward()
@@ -92,6 +109,14 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id):
     if not torch.isfinite(norm).item():
         raise RuntimeError("Non-finite actor gradient. The previous checkpoint is intact.")
     optimizer.step()
+    if opsd is not None:
+        if world > 1:
+            dist.all_reduce(distill, op=dist.ReduceOp.SUM)
+        means = (distill / token_count.clamp_min(1)).tolist()
+        return grpo_sum / normalizer, float(norm), {
+            "sdar/token_loss": means[0], "sdar/gate_mean": means[1], "sdar/teacher_gap": means[2],
+            "sdar/tokens": int(token_count),
+        }
     return grpo_sum / normalizer, float(norm)
 
 
@@ -108,11 +133,18 @@ def write_rollouts(folder, group):
     })
 
 
-def _loop(work, sft, rank, size, device, limit):
+def _loop(work, sft, rank, size, device, limit, *, rethink=False):
     from transformers import AutoProcessor, AutoTokenizer
 
     load_upstream()
     required_env("SERPER_API_KEY")
+    if rethink:
+        from .hints import settings_from_env
+
+        hint_settings = settings_from_env()
+        opsd = teacher.recipe()
+    else:
+        opsd = None
     cfg = read_json(ROOT / "configs" / "evolve.json")
     if cfg["prompt_batch"] % size:
         raise ValueError("prompt_batch must split into whole groups across GPU ranks.")
@@ -123,24 +155,32 @@ def _loop(work, sft, rank, size, device, limit):
     random.Random(cfg["seed"]).shuffle(pool)
     total = limit if limit is not None else math.ceil(len(pool) / cfg["prompt_batch"])
     if total < 1:
-        raise ValueError("At least one GRPO update is required.")
-    out = work / "grpo"
+        raise ValueError("At least one RL update is required.")
+    out = work / ("rethink" if rethink else "grpo")
     out.mkdir(parents=True, exist_ok=True)
     final = out / "final"
     # Only one rank reads the several-GB SFT weight files for provenance.
     inputs = gather({
-        "sft": sft_manifest(sft),
-        "train_jsonl_sha256": file_sha256(dataset / "train.jsonl"),
+        "sft": verify_route_export(sft) if rethink else verify_parent(sft),
+        "train_jsonl_sha256": verify_split(dataset, "train"),
     } if rank == 0 else None)[0]
-    contract = {"algorithm": "grpo", "sources": source_lock(), **inputs,
+    contract = {"algorithm": "grpo+actor-routed-opsd" if rethink else "grpo",
+                "sources": source_lock(), **inputs,
                 "config": cfg, "judge": judge_settings(cfg), "world_size": size, "total_steps": total}
+    if rethink:
+        contract.update(actor_text_protocol=ACTOR_TEXT_PROTOCOL, opsd=opsd,
+                        hint_api=hint_settings.identity(),
+                        teacher_text_sha256={
+                            name: file_sha256(ROOT / "configs" / name)
+                            for name in ("static_skill.txt", "local_hint_system.txt")
+                        })
     if (out / "contract.json").is_file() and read_json(out / "contract.json") != contract:
-        raise RuntimeError("This work directory has a different GRPO, SFT, or training-data identity.")
+        raise RuntimeError("This work directory has a different RL, SFT, or training-data identity.")
     if rank == 0:
         write_json(out / "contract.json", contract)
     if model_ready(final) and (final / "completed.json").is_file() and read_json(final / "completed.json")["step"] == total:
         if rank == 0:
-            print(f"GRPO complete at {final}", flush=True)
+            print(f"RL complete at {final}", flush=True)
         return
     checkpoint_path = latest(out)
     saved = load_checkpoint(checkpoint_path) if checkpoint_path else None
@@ -159,6 +199,8 @@ def _loop(work, sft, rank, size, device, limit):
     del saved
     processor = AutoProcessor.from_pretrained(sft)
     tokenizer = AutoTokenizer.from_pretrained(sft, use_fast=True)
+    if rethink:
+        teacher.verify_marker(tokenizer)
     replica = load_model(sft, torch.bfloat16).eval()
     reference = load_model(sft, torch.bfloat16).eval()
     if rng:
@@ -183,13 +225,19 @@ def _loop(work, sft, rank, size, device, limit):
             groups.append(group)
             write_rollouts(path, group)
 
+        if rethink:
+            # Same current-Actor replica used for rollout; no update has been
+            # performed yet. The frozen reference below is ONLY the baseline KL.
+            hint_stats = teacher.score_groups(groups, scorer, tokenizer, cfg, device, hint_settings)
+            hint_totals = gather(dict(hint_stats))
         replica.cpu()
         torch.cuda.empty_cache()
         reference.to(device)
         score_reference(groups, ActorScorer(reference), cfg, device)
         reference.cpu()
         torch.cuda.empty_cache()
-        grpo, norm = update_actor(actor, optimizer, groups, cfg, device, tokenizer.eos_token_id)
+        result = update_actor(actor, optimizer, groups, cfg, device, tokenizer.eos_token_id, opsd=opsd)
+        grpo, norm = result[:2]
         scheduler.step()
         outcomes = [outcome for group in groups for outcome in group.outcomes]
         metrics = gather({
@@ -200,6 +248,12 @@ def _loop(work, sft, rank, size, device, limit):
         if rank == 0:
             row = {k: fmean(item[k] for item in metrics) for k in metrics[0]}
             row.update(step=step + 1, lr=scheduler.get_last_lr()[0])
+            if rethink:
+                row.update(result[2])
+                for name in ("turns", "generated_marker", "native_boundary", "eligible", "hint_trajectories", "api_attempts",
+                             "local_used", "static_fallback", "teacher_turns", "teacher_context_overflow"):
+                    row[f"rethink/{name}"] = sum(s.get(name, 0) for s in hint_totals)
+                row["rethink/trigger_fraction"] = row["rethink/generated_marker"] / max(1, row["rethink/turns"])
             write_json(out / "metrics" / f"step-{step + 1:05d}.json", row)
             print(row, flush=True)
         if (step + 1) % cfg["save_every"] == 0 or step + 1 == total:
@@ -209,9 +263,9 @@ def _loop(work, sft, rank, size, device, limit):
     export_policy(final, actor, replica, processor, total, rank)
 
 
-def worker(work, sft, limit):
+def worker(work, sft, limit, *, rethink=False):
     rank, size, device = initialize()
     try:
-        _loop(work, sft, rank, size, device, limit)
+        _loop(work, sft, rank, size, device, limit, rethink=rethink)
     finally:
         dist.destroy_process_group()

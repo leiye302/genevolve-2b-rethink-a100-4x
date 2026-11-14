@@ -193,6 +193,7 @@ class EvaluationFallbackTest(unittest.TestCase):
         })
         with patch("genevolve_repro.evaluate.required_env"), \
                 patch("genevolve_repro.evaluate.model_ready", return_value=True), \
+                patch("genevolve_repro.evaluate.verify_split", return_value="fixture-split"), \
                 patch("genevolve_repro.evaluate.examples", return_value=[self.example] * 594), \
                 patch("genevolve_repro.evaluate.jsonl", return_value=iter([{}] * 594)), \
                 patch("genevolve_repro.evaluate.judge_settings", return_value={}), \

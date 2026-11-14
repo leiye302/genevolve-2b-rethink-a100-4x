@@ -3,6 +3,10 @@
 /work/
 /.env
 /.env.*
+/private_inputs/
+*.safetensors
+*.pt
+*.bin
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -6,11 +6,13 @@ import torch.distributed as dist
 from .actor_text import ACTOR_TEXT_PROTOCOL
 
 from .common import BENCH, RL, ROOT, jsonl, load_upstream, model_ready, read_json, required_env, write_json
-from .data import examples
+from .data import examples, verify_split
 from .distributed import barrier, initialize, load_model
 from .evaluation_render import EVALUATION_RENDER_POLICY, render_for_evaluation
 from .feedback import LiveFeedback, image_scorer, judge_settings
 from .policy import make_agent, valid_program
+from .route_data import MARKER_ID
+from .teacher import is_routed
 
 
 def evaluate_case(agent, feedback, example, metadata, image_path):
@@ -21,6 +23,12 @@ def evaluate_case(agent, feedback, example, metadata, image_path):
         "id": example.id, "prompt": example.prompt, "gt_image": str(example.gt),
         "result": result.to_dict(), "success": False, "eval_success": False,
         "program_valid": valid_program(result),
+    }
+    turns = getattr(trajectory, "turns", ())
+    marked = [t for t in turns if MARKER_ID in t.tokens and t.response and "<RETHINK>" in t.response]
+    row["route_telemetry"] = {
+        "turns": len(turns), "marker_turns": len(marked),
+        "native_boundary_turns": sum(is_routed(t) for t in marked),
     }
     row.update(render_for_evaluation(feedback.renderer, result, example.prompt, image_path))
     if row["success"]:
@@ -56,6 +64,7 @@ def _evaluate(work, policy, split, max_cases, rank, size, device):
     else:
         data, name = (BENCH, "test") if split == "bench" else (RL, "eval")
         dataset = work / "data" / data
+        split_sha = verify_split(dataset, name)
         pool = examples(dataset, name)
         metadata = list(jsonl(dataset / f"{name}.jsonl"))
         count = 594 if split == "bench" else 600
@@ -67,16 +76,19 @@ def _evaluate(work, policy, split, max_cases, rank, size, device):
         count = max_cases
     marker = policy / "completed.json"
     suffix = "" if max_cases is None else f"-{max_cases}-cases"
-    folder = work / "eval" / f"{split}-{policy.name}{suffix}"
+    name = policy.name if policy.name != "final" else f"{policy.parent.name}-final"
+    folder = work / "eval" / f"{split}-{name}{suffix}"
     cfg = read_json(ROOT / "configs" / "evolve.json")
     contract = {
         "policy": str(policy), "split": split, "count": count,
         "checkpoint": read_json(marker) if marker.is_file() else None,
         "render_policy": EVALUATION_RENDER_POLICY,
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL,
+        "route_telemetry_version": 1,
     }
     if split != "wise":
         contract["judge"] = judge_settings(cfg)
+        contract["split_sha256"] = split_sha
     lock = folder / "config.json"
     if lock.is_file() and read_json(lock) != contract:
         raise RuntimeError(
@@ -113,6 +125,15 @@ def _evaluate(work, policy, split, max_cases, rank, size, device):
     if rank == 0:
         rows = [read_json(folder / "cases" / f"{i:05d}.json") for i in range(count)]
         scores = summarize_wise(folder, rows) if split == "wise" else summarize(folder, rows)["all"]
+        if split != "wise":
+            fields = ("turns", "marker_turns", "native_boundary_turns")
+            route = {k: sum(row["route_telemetry"][k] for row in rows) for k in fields}
+            route.update(cases=count, decision_trigger_rate=route["marker_turns"] / max(1, route["turns"]),
+                         native_boundary_rate_given_marker=(
+                             route["native_boundary_turns"] / route["marker_turns"] if route["marker_turns"] else None
+                         ),
+                         cases_with_marker=sum(row["route_telemetry"]["marker_turns"] > 0 for row in rows))
+            write_json(folder / "route_telemetry.json", route)
         print(scores, flush=True)
         print(f"Benchmark artifacts at {folder}", flush=True)
 

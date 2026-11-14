@@ -1,0 +1,13 @@
+{
+  "sdar_coef": 0.01,
+  "gate_beta": 5.0,
+  "loss_agg_mode": "token-mean",
+  "hint_max_tokens": 96,
+  "hint_timeout": 45,
+  "hint_attempts": 2,
+  "hint_parallel_per_rank": 4,
+  "hint_request_tokens": 2048,
+  "hint_model": "glm-5.3-flash",
+  "hint_reasoning_effort": "low",
+  "hint_update_budget_s": 180
+}

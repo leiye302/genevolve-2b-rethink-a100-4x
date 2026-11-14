@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from .common import BENCH, RL, jsonl, relative_image, source_lock, write_json
+from .common import BENCH, RL, ROOT, jsonl, read_json, relative_image, source_lock, write_json
+from .sft_export import file_sha256
 
 
 @dataclass(frozen=True)
@@ -29,11 +30,21 @@ def verify_data(work):
     folder = work / "data"
     counts = {}
     for dataset, split, count in ((RL, "train", 2575), (RL, "eval", 600), (BENCH, "test", 594)):
+        verify_split(folder / dataset, split)
         actual = len(examples(folder / dataset, split))
         if actual != count:
             raise ValueError(f"{dataset}/{split} has {actual} rows, expected {count}")
         counts[f"{dataset}/{split}"] = actual
     return counts
+
+
+def verify_split(folder, split):
+    filename = f"{folder.name}/{split}.jsonl"
+    expected = read_json(ROOT / "configs" / "split_sha256.json")[filename]
+    actual = file_sha256(folder / f"{split}.jsonl")
+    if actual != expected:
+        raise ValueError(f"{filename} differs from the pinned benchmark split; rerun prepare.")
+    return actual
 
 
 def prepare(work):

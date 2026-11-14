@@ -15,8 +15,9 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from .common import WORLD_SIZE, write_json
+from .common import WORLD_SIZE, read_json, write_json
 from .policy import ActorScorer
+from .sft_export import file_sha256
 
 
 def initialize():
@@ -37,7 +38,7 @@ def load_model(path, dtype, attention="flash_attention_2"):
     )
 
 
-def make_sharded_actor(path, device, saved=None):
+def make_sharded_actor(path, device, saved=None, scorer_type=ActorScorer):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer
 
     # Load the attention backend after loading FP32 master weights. FSDP
@@ -46,7 +47,7 @@ def make_sharded_actor(path, device, saved=None):
     policy.set_attn_implementation("flash_attention_2")
     policy.model.visual.requires_grad_(False)
     policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    scorer = ActorScorer(policy)
+    scorer = scorer_type(policy)
     if saved is not None:
         scorer.load_state_dict(saved)
     return FSDP(
@@ -131,7 +132,11 @@ def latest(folder):
 
 
 def load_checkpoint(path):
-    return torch.load(path / "training.pt", map_location="cpu", mmap=True, weights_only=True)
+    payload = path / "training.pt"
+    receipt = path / "state_sha256.json"
+    if receipt.is_file() and read_json(receipt)["training.pt"] != file_sha256(payload):
+        raise ValueError(f"Checkpoint SHA-256 mismatch: {path.name}.")
+    return torch.load(payload, map_location="cpu", mmap=True, weights_only=True)
 
 
 def restore_optimizer(actor, optimizer, scheduler, saved, rank):
@@ -158,7 +163,7 @@ def restore_rng(value, device):
         torch.cuda.set_rng_state(value["cuda"], device)
 
 
-def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, device, keep=2):
+def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, device, keep=2, verify=False):
     states = gather(get_rng(device))
     with full_state(actor):
         model = actor.state_dict()
@@ -167,10 +172,20 @@ def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, d
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / f"checkpoint-{step:05d}"
         temporary = Path(mkdtemp(prefix=".checkpoint-", dir=folder))
+        payload = temporary / "training.pt"
         torch.save({
             "step": step, "contract": contract, "actor": model, "optimizer": optimizer_state,
             "scheduler": scheduler.state_dict(), "rng": states,
-        }, temporary / "training.pt")
+        }, payload)
+        if verify:
+            restored = torch.load(payload, map_location="cpu", mmap=True, weights_only=True)
+            if (restored["step"] != step or restored["contract"] != contract
+                    or restored["actor"].keys() != model.keys()
+                    or restored["optimizer"].keys() != optimizer_state.keys()
+                    or len(restored["rng"]) != len(states)):
+                raise ValueError("The newly saved checkpoint is incomplete.")
+            del restored
+            write_json(temporary / "state_sha256.json", {"training.pt": file_sha256(payload)})
         temporary.rename(target)
         for previous in checkpoints(folder)[:-keep]:
             resolved = previous.resolve()
@@ -180,12 +195,12 @@ def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, d
     barrier()
 
 
-def export_policy(folder, actor, replica, processor, step, rank):
+def export_policy(folder, actor, replica, processor, step, rank, metadata=None):
     copy_actor(actor, replica, rank0_only=True)
     if rank == 0:
         temporary = Path(mkdtemp(prefix=".export-", dir=folder.parent))
         replica.save_pretrained(temporary, safe_serialization=True)
         processor.save_pretrained(temporary)
-        write_json(temporary / "completed.json", {"step": step})
+        write_json(temporary / "completed.json", {"step": step, **(metadata or {})})
         temporary.rename(folder)
     barrier()

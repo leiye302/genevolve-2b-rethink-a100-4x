@@ -33,6 +33,7 @@ class ContractTest(unittest.TestCase):
             fake_export(sft)
             args = argparse.Namespace(command="grpo", sft_checkpoint=sft, steps=2)
             with patch.dict(os.environ, {"SERPER_API_KEY": "fixture", "JUDGE_API_KEY": "fixture"}), \
+                    patch("genevolve_repro.runtime.preflight"), \
                     patch.object(run.subprocess, "run") as child:
                 run.execute(args, work)
             child.assert_called_once_with(
@@ -62,8 +63,8 @@ class ContractTest(unittest.TestCase):
                 export_files(folder)
             fake_export(folder)
             write_json(folder / "config.json",
-                       {"model_type": "qwen3_vl", "text_config": {**TEXT_SIGNATURE, "hidden_size": 4096}})
-            with self.assertRaisesRegex(ValueError, "matched Qwen3-VL-2B"):
+                       {"model_type": "qwen3_vl", "text_config": {**TEXT_SIGNATURE, "hidden_size": 2048}})
+            with self.assertRaisesRegex(ValueError, "matched Qwen3-VL-8B"):
                 export_files(folder)
             write_json(folder / "config.json", {"model_type": "qwen3_vl", "text_config": TEXT_SIGNATURE})
             write_json(folder / "model.safetensors.index.json",

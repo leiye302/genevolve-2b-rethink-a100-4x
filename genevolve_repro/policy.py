@@ -18,6 +18,9 @@ class Turn:
     tokens: list[int]
     old: torch.Tensor | None = None
     reference: torch.Tensor | None = None
+    messages: list[dict] | None = None
+    response: str | None = None
+    teacher: torch.Tensor | None = None
 
 
 @dataclass
@@ -152,9 +155,11 @@ def make_agent(model, tokenizer, device, config, **tools):
                 tokens = output[0, len(prefix):].tolist()
                 if not tokens:
                     raise RuntimeError("The actor returned zero tokens.")
-                self.turns.append(Turn(prefix, tokens))
+                response = decode_actor_response(tokenizer, tokens)
+                self.turns.append(Turn(prefix, tokens, messages=[dict(m) for m in messages],
+                                       response=response))
                 self.generated += len(tokens)
-                return decode_actor_response(tokenizer, tokens)
+                return response
             except Exception as error:
                 self.failure = error
                 raise
