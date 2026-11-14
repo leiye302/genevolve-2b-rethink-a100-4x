@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 import re
 
 import torch
@@ -9,7 +10,30 @@ from torch.utils.checkpoint import checkpoint
 from .actor_text import decode_actor_response
 
 
+ACTION = re.compile(r"<tool_call>.*?</tool_call>|<answer>.*?</answer>", re.DOTALL)
 RAW_REFERENCE = re.compile(r"https?://|IMG_\d+", re.IGNORECASE)
+
+
+def action_indices(tokenizer, tokens):
+    """Locate generated tool-call and final-program tokens, excluding reasoning."""
+    text = tokenizer.decode(tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    spans = [match.span() for match in ACTION.finditer(text)]
+    if not spans:
+        return []
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = encoded["offset_mapping"]
+    eligible = {
+        i for i, (start, end) in enumerate(offsets)
+        if end > start and any(start < right and end > left for left, right in spans)
+    }
+    if encoded["input_ids"] == tokens:
+        return sorted(eligible)
+    # A generated BPE sequence need not be the canonical encoding of its text.
+    matched = SequenceMatcher(a=encoded["input_ids"], b=tokens, autojunk=False)
+    return [
+        block.b + offset for block in matched.get_matching_blocks()
+        for offset in range(block.size) if block.a + offset in eligible
+    ]
 
 
 @dataclass
@@ -21,6 +45,8 @@ class Turn:
     messages: list[dict] | None = None
     response: str | None = None
     teacher: torch.Tensor | None = None
+    action: list[int] = field(default_factory=list)
+    distill: torch.Tensor | None = None
 
 
 @dataclass
@@ -82,11 +108,25 @@ def tokenize_history(tokenizer, messages):
     return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
 
 
+def teacher_prefix(tokenizer, messages, guidance):
+    teacher_messages = [dict(message) for message in messages]
+    system = teacher_messages[0]["content"]
+    tool_section = "# Tools"
+    before, found, after = system.partition(tool_section)
+    if not found:
+        raise ValueError("The pinned agent's system prompt has no # Tools section.")
+    teacher_messages[0]["content"] = (
+        f"{before}\n<visual_experience>\n{guidance}\n</visual_experience>\n\n"
+        f"{found}{after}"
+    )
+    return tokenize_history(tokenizer, teacher_messages)
+
+
 class BudgetExhausted(Exception):
     pass
 
 
-def make_agent(model, tokenizer, device, config, **tools):
+def make_agent(model, tokenizer, device, config, *, track_actions=False, **tools):
     from .common import load_upstream
 
     load_upstream()
@@ -157,7 +197,8 @@ def make_agent(model, tokenizer, device, config, **tools):
                     raise RuntimeError("The actor returned zero tokens.")
                 response = decode_actor_response(tokenizer, tokens)
                 self.turns.append(Turn(prefix, tokens, messages=[dict(m) for m in messages],
-                                       response=response))
+                                       response=response,
+                                       action=action_indices(tokenizer, tokens) if track_actions else []))
                 self.generated += len(tokens)
                 return response
             except Exception as error:

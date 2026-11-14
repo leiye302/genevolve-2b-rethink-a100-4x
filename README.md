@@ -1,6 +1,6 @@
 # GenEvolve 2B：ReActOPSD（4×A100 80GB）
 
-在 **GenEvolve 的 Qwen3-VL-2B-Instruct SFT checkpoint-550** 后接两轮 Route-SFT，再接相同的 GRPO 与本方法的 Actor-routed OPSD。与 2B 基线共享同一份原始 SFT 权重；不重新做冷启动 SFT，不改工具、反馈、渲染或评分。
+在 **GenEvolve 的 Qwen3-VL-2B-Instruct SFT checkpoint-550** 后接两轮 Route-SFT，再在原版 GenEvolve 的 **GRPO + SDL** 上加入 Actor-routed 局部 hint。和 [ALFWorld 主方法](https://github.com/leiye302/rethink-alfworld-qwen25-3b) 一样，只让 Actor 决定触发、只给原有 Teacher 增加局部信息；保留目标环境自己的蒸馏方式。与 2B 基线共享同一份初始 SFT 权重，不重新做冷启动 SFT。
 
 对照来源：[2B GRPO](https://github.com/leiye302/genevolve-2b-grpo-a100-4x/tree/2f197591100d8b0bf61e65be9748a0752f91ae30) · [2B GenEvolve 自进化及 SFT](https://github.com/leiye302/GenEvolve-2B-Reproduction/tree/57263f0583c633c3d515913b9935c3850cdf798e) · [作者代码](https://github.com/MeiGen-AI/GenEvolve/tree/23c847c559ccc0f95bbf4b3d8925898463822f4c)。做配对比较时，用 baseline 实际读取的同一份 HF 导出，逐文件比较权重 SHA-256，不能只比较模型名、目录名或训练步数。
 
@@ -12,6 +12,7 @@
 | 数据与 rollout | 固定版本 GenEvolve-Data-RL，训练 2,575 题；seed 42，每步 8 题 × 每题 6 条轨迹，四卡各负责 2 个完整题组 |
 | 采样 | temperature 0.7，top-p 0.95，最多 11 回合／每回合 4,096 新 token，整轨迹 30,000，初始输入 6,144，上下文 65,536 |
 | GRPO | 原组内标准化、0.20/0.28 非对称裁剪、轨迹 KL 惩罚系数 0.001、程序奖励权重 0.5、LR 1e-6、cosine；保留基线 FSDP 布局 |
+| GenEvolve SDL | 保留原经验提取、检索、动作区间 top-10% 选择、SDL 损失及其系数 2.0；不改成 SDAR 门控 |
 | 保存与续训 | 二阶段每 10 步和最后一步存，保留最近两份可续训断点；另导出最终 HF 模型 |
 | 渲染与评分 | 固定 Qwen-Image-Edit-2511，40 步、CFG 4、seed 0、最多两张参考图；基线的 `qwen3.7-flash-2026-07-15` 奖励和 KScore 评审 |
 | 终评 | GenEvolve-Bench 同序 594 题、KScore、原版 prompt fallback；temperature 0.6、top-p 0.9、逐题 seed=42+序号；可选同版 RL-val 600 或 WISE 1000 |
@@ -28,16 +29,16 @@
 - 按原序扫描 297 个固定批次两遍：全局 8，四卡 × micro 1 × 累积 2，**594 updates**。LR 2e-6，前 10% warmup、cosine、AdamW (0.9, 0.95)、weight decay 0.01、clip 1.0、seed 0。语言参数全参训练，视觉塔不动。
 - 最长 11,223 tokens；使用 12,288 上限，超长直接报错，不重分词或截断。每轮存原生可续训状态和 HF 导出。该封版包只供训练，没有另造 SFT val split；日志中的 train loss 和给定前缀 marker 概率不是自由生成指标。
 
-## 二阶段：GRPO + Actor-routed OPSD
+## 二阶段：GenEvolve GRPO + SDL，Actor 路由局部 hint
 
-完整轨迹做 GRPO。Teacher 是**当前这轮 Actor 的无梯度副本**，评分同一批原始生成 token：
+完整轨迹做原来的 GRPO。保留 GenEvolve 的高低奖励轨迹配对、视觉经验提取、经验库和检索；与原版一样，新经验在本轮更新后进入库，不用于同一轮检索。Teacher 用**更新前同一个 Actor 的无梯度副本**对原始生成 token 评分：
 
 | Actor 的该回合 | Teacher 的额外条件 |
 | --- | --- |
-| 无特殊 token `<RETHINK>` | GenEvolve 通用静态 skill |
-| Actor 生成特殊 token `<RETHINK>` | 同一静态 skill + 该回合的局部 hint；缺失、超长或引用当前未见图像时退回静态 skill |
+| 无特殊 token `<RETHINK>` | 原样使用检索到的视觉经验；没有检索经验时不蒸馏，照常做 GRPO |
+| Actor 生成特殊 token `<RETHINK>` | 原来检索的经验 + 当前回合 hint；空库时可以用 hint 单独给 Teacher 提供条件；hint 不合格时回退到原版条件 |
 
-detach Teacher 和门控 `sigmoid(5 × (logp_teacher − logp_student))`；按有效 token 平均，系数 **0.01**。方法版不叠加对照的 GenEvolve 经验库／top-10% SDL。基线的 frozen reference 只用于原奖励 KL，不是蒸馏 Teacher。局部 API 每条带 marker 的轨迹发一组请求（失败有限重试）；只给指定回合提示，不打 Good/Bad、不替 Actor 执行动作、不做 episode 经验总结。Student、工具、终评均不读 hint。marker 格式和位置只统计，不作为路由门禁。
+Teacher 分数进入原版 GenEvolve 的 action-span token 选择与 SDL（仍使用原比例、系数和截断），不是另一个损失。基线的 frozen reference 仍只用于原奖励 KL。局部 API 每条带 marker 的轨迹发一组请求（失败有限重试），不打 Good/Bad、不替 Actor 执行动作、也不替代或写入原经验库。Student、工具、终评均不读 hint。marker 的位置只做统计，不作为路由门禁。
 
 ## 运行
 
@@ -62,7 +63,7 @@ export ROUTE_DATA=/path/to/route_sft_6g2b_final_v3_reviewed
 python run.py check-route --parent "$PARENT" --data "$ROUTE_DATA"
 ```
 
-二阶段和评测需要 Serper + 基线 Judge；仅方法训练额外需要局部 hint API（`glm-5.3-flash`、低思考、HTTPS OpenAI-compatible chat completions；OpenCode Go 每条轨迹使用独立会话 ID）。先确认服务商允许接收训练轨迹。hint 请求只带本条 rollout 的文本证据和指定步号，不带真值图或本地图片路径。凭据通过环境注入，不写进 Git 或命令行。详见 [环境变量模板](configs/services.env.example)。
+二阶段和评测需要 Serper + 基线 Judge；二阶段原有的视觉经验提取也继续使用基线 Judge。方法训练额外需要局部 hint API（`glm-5.3-flash`、低思考、HTTPS OpenAI-compatible chat completions；OpenCode Go 每条轨迹使用独立会话 ID）。先确认服务商允许接收训练轨迹。**局部 hint 请求**只带本条 rollout 的文本证据和指定步号，不带真值图或本地图片路径；**原版经验提取**按既有实现向 Judge 提供 best/worst 渲染及参考目标图。凭据通过环境注入，不写进 Git 或命令行。详见 [环境变量模板](configs/services.env.example)。
 
 ```bash
 export QWEN_SERVICE_URL=http://render-host:8001
@@ -77,9 +78,9 @@ python run.py --work "$WORK" all --parent "$PARENT" --data "$ROUTE_DATA"
 python run.py --work "$WORK" eval --split bench
 ```
 
-只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"`。重新执行 `all` 会复用已验收的官方数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
+只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"`。二阶段入口自动准备固定版本的 Qwen3-Embedding-0.6B，也可用 `prepare-embedding` 提前下载。重新执行 `all` 会复用已验收的官方数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
 
-同 2B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，写入 `WORK/grpo`，不调用 hint API。GenEvolve 的 GRPO+SDL 仍在独立对照仓库。原冷启动和 Route-SFT 两轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启训练使用原命令、同一 WORK、数据、起点、计划步数与服务配置；方法二阶段只接受两轮完成且通过 SHA 检查的 Route-SFT 导出。不要把 8B 的工作目录或二阶段断点用于 2B。逐步指标、rollout、运行清单与续训状态保留在 WORK。
+同 2B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，不调用 hint API；不带 RETHINK 的 GenEvolve 对照请用独立的 2B 复现仓库。原冷启动和 Route-SFT 两轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启使用原命令、同一 WORK、数据、起点、计划步数与服务配置；二阶段断点保存原版经验库。旧版 SDAR 二阶段断点不能接续到这版；相同协议下已验收的 2B Route-SFT 导出可复用。不要把 8B 的断点用于 2B。
 
 终评在不改分数的前提下另写 `route_telemetry.json`，按决策回合统计原生特殊 marker，并单列位置正确率，不按总 token 数作分母。RL-val 同样记录。
 

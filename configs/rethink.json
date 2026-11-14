@@ -1,7 +1,4 @@
 {
-  "sdar_coef": 0.01,
-  "gate_beta": 5.0,
-  "loss_agg_mode": "token-mean",
   "hint_max_tokens": 96,
   "hint_timeout": 45,
   "hint_attempts": 2,

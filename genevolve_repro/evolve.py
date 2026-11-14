@@ -12,13 +12,14 @@ import torch.distributed as dist
 from .actor_text import ACTOR_TEXT_PROTOCOL
 
 from .common import RL, ROOT, load_upstream, model_ready, read_json, required_env, source_lock, write_json
-from .data import examples, verify_split
+from .data import embedding_ready, examples, verify_split
 from .distributed import (
     copy_actor, export_policy, gather, initialize, latest, load_checkpoint, load_model,
     make_sharded_actor, max_count, restore_optimizer, restore_rng, save_checkpoint,
 )
-from .feedback import LiveFeedback, judge_settings
-from .objectives import advantages, grpo_loss, kl_reward
+from .feedback import LiveFeedback, contrast_pair, judge_settings
+from .memory import Embedder, ExperienceBank
+from .objectives import advantages, grpo_loss, kl_reward, loss_terms
 from .policy import ActorScorer, make_agent, score_turn
 from .route_data import verify_parent
 from .route_sft import verify_route_export
@@ -59,7 +60,7 @@ def score_reference(groups, scorer, cfg, device):
                 turn.reference = score_turn(scorer, turn.prefix, turn.tokens, cfg["temperature"], device).cpu()
 
 
-def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, opsd=None):
+def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, use_sdl=False):
     # Every rank owns the same number of whole prompt groups. FSDP averages
     # gradients across ranks, so the local sequence denominator is sufficient.
     normalizer = sum(len(group.trajectories) for group in groups)
@@ -75,17 +76,7 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, opsd=None):
     if count == 0:
         raise RuntimeError("All trajectories were empty. Check the model and generation budgets.")
     optimizer.zero_grad(set_to_none=True)
-    grpo_sum = 0.0
-    if opsd is not None:
-        local_tokens = sum(len(turn.tokens) for turn, _ in jobs if turn.teacher is not None)
-        token_count = torch.tensor(local_tokens, dtype=torch.long, device=device)
-        world = dist.get_world_size() if dist.is_initialized() else 1
-        if world > 1:
-            dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        # FSDP averages gradients. Convert the local sum into the shared
-        # global token mean regardless of turn count, length or API misses.
-        token_scale = world / max(1, int(token_count))
-        distill = torch.zeros(3, device=device)
+    grpo_sum = sdl_sum = 0.0
     for i in range(count):
         # Offloaded FSDP needs no_sync for accumulation. A short dummy turn
         # keeps collective order identical when trajectories end at different times.
@@ -94,13 +85,14 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, opsd=None):
             if i < len(jobs):
                 turn, advantage = jobs[i]
                 new = score_turn(actor, turn.prefix, turn.tokens, cfg["temperature"], device)
-                grpo = grpo_loss(new, turn, advantage, cfg)
-                loss = grpo / normalizer
+                if use_sdl:
+                    grpo, sdl = loss_terms(new, turn, advantage, cfg)
+                    loss = (grpo + cfg["sdl_coef"] * sdl) / normalizer
+                    sdl_sum += sdl.detach().item()
+                else:
+                    grpo = grpo_loss(new, turn, advantage, cfg)
+                    loss = grpo / normalizer
                 grpo_sum += grpo.detach().item()
-                if opsd is not None and turn.teacher is not None:
-                    terms, gate, gap = teacher.sdar_token_terms(new, turn.teacher, opsd["gate_beta"])
-                    loss = loss + opsd["sdar_coef"] * token_scale * terms.sum()
-                    distill += torch.stack((terms.detach().sum(), gate.sum(), gap.sum()))
             else:
                 loss = score_turn(actor, [dummy_id], [dummy_id], cfg["temperature"], device).sum() * 0
             loss.backward()
@@ -109,25 +101,21 @@ def update_actor(actor, optimizer, groups, cfg, device, dummy_id, *, opsd=None):
     if not torch.isfinite(norm).item():
         raise RuntimeError("Non-finite actor gradient. The previous checkpoint is intact.")
     optimizer.step()
-    if opsd is not None:
-        if world > 1:
-            dist.all_reduce(distill, op=dist.ReduceOp.SUM)
-        means = (distill / token_count.clamp_min(1)).tolist()
-        return grpo_sum / normalizer, float(norm), {
-            "sdar/token_loss": means[0], "sdar/gate_mean": means[1], "sdar/teacher_gap": means[2],
-            "sdar/tokens": int(token_count),
-        }
+    if use_sdl:
+        return grpo_sum / normalizer, float(norm), sdl_sum / normalizer
     return grpo_sum / normalizer, float(norm)
 
 
-def write_rollouts(folder, group):
+def write_rollouts(folder, group, use_sdl=False):
     write_json(folder / "rollouts.json", {
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL,
         "id": group.example.id,
         "prompt": group.example.prompt,
         "trajectories": [
             {"result": trajectory.result.to_dict(), "outcome": outcome.to_dict(),
-             "sampled_tokens": sum(len(turn.tokens) for turn in trajectory.turns)}
+             "sampled_tokens": sum(len(turn.tokens) for turn in trajectory.turns),
+             **({"sdl_tokens": sum(int(turn.distill.sum()) for turn in trajectory.turns
+                                   if turn.distill is not None)} if use_sdl else {})}
             for trajectory, outcome in zip(group.trajectories, group.outcomes, strict=True)
         ],
     })
@@ -142,10 +130,12 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         from .hints import settings_from_env
 
         hint_settings = settings_from_env()
-        opsd = teacher.recipe()
-    else:
-        opsd = None
+        hint_cfg = teacher.recipe()
+        if not embedding_ready(work):
+            raise RuntimeError("Missing the pinned embedding model; run prepare-embedding before rethink.")
     cfg = read_json(ROOT / "configs" / "evolve.json")
+    if rethink:
+        cfg.update(read_json(ROOT / "configs" / "genevolve_sdl.json"))
     if cfg["prompt_batch"] % size:
         raise ValueError("prompt_batch must split into whole groups across GPU ranks.")
     dataset = work / "data" / RL
@@ -164,15 +154,15 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         "sft": verify_route_export(sft) if rethink else verify_parent(sft),
         "train_jsonl_sha256": verify_split(dataset, "train"),
     } if rank == 0 else None)[0]
-    contract = {"algorithm": "grpo+actor-routed-opsd" if rethink else "grpo",
+    contract = {"algorithm": "genevolve-grpo+sdl+actor-routed-hints" if rethink else "grpo",
                 "sources": source_lock(), **inputs,
                 "config": cfg, "judge": judge_settings(cfg), "world_size": size, "total_steps": total}
     if rethink:
-        contract.update(actor_text_protocol=ACTOR_TEXT_PROTOCOL, opsd=opsd,
+        contract.update(actor_text_protocol=ACTOR_TEXT_PROTOCOL, local_hints=hint_cfg,
                         hint_api=hint_settings.identity(),
                         teacher_text_sha256={
                             name: file_sha256(ROOT / "configs" / name)
-                            for name in ("static_skill.txt", "local_hint_system.txt")
+                            for name in ("local_hint_system.txt",)
                         })
     if (out / "contract.json").is_file() and read_json(out / "contract.json") != contract:
         raise RuntimeError("This work directory has a different RL, SFT, or training-data identity.")
@@ -186,6 +176,10 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
     saved = load_checkpoint(checkpoint_path) if checkpoint_path else None
     if saved and saved["contract"] != contract:
         raise RuntimeError("Saved checkpoint configuration does not match this run.")
+    if rethink:
+        if saved and "memory" not in saved:
+            raise RuntimeError("Incomplete GenEvolve checkpoint: missing the experience bank.")
+        memory = ExperienceBank(cfg["experience_capacity"], saved["memory"] if saved else None)
     start = saved["step"] if saved else 0
     random.seed(cfg["seed"] + rank)
     torch.manual_seed(cfg["seed"] + rank)
@@ -207,7 +201,8 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         restore_rng(rng, device)
     os.environ.setdefault("IMAGE_DOWNLOAD_DIR", str(work / "cache" / f"grpo-rank{rank}"))
     feedback = LiveFeedback(cfg, size)
-    agent = make_agent(replica, tokenizer, device, cfg)
+    embedder = Embedder(work / "embedding") if rethink else None
+    agent = make_agent(replica, tokenizer, device, cfg, track_actions=rethink)
     actor.train()
     local_batch = cfg["prompt_batch"] // size
 
@@ -215,7 +210,7 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         replica.to(device)
         copy_actor(actor, replica)
         scorer = ActorScorer(replica)
-        groups = []
+        groups, guidance, added, paths = [], [], [], []
         for offset in range(local_batch):
             index = (step * cfg["prompt_batch"] + rank * local_batch + offset) % len(pool)
             example = pool[index]
@@ -223,42 +218,58 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
             group = gather_group(agent, feedback, example, path, cfg["rollouts_per_prompt"])
             score_group(group, scorer, cfg, device)
             groups.append(group)
-            write_rollouts(path, group)
+            paths.append(path)
+            if rethink:
+                # The retrieved entry is from earlier updates only. Keep the
+                # native contrastive experience-generation path unchanged.
+                vector = embedder(example.prompt)
+                guidance.append(memory.retrieve(vector))
+                pair = contrast_pair(group.trajectories, group.outcomes, cfg["min_reward_gap"])
+                if pair is not None:
+                    best, worst, gap = pair
+                    bundle = feedback.summarize(example, best, worst)
+                    added.append({"vector": vector, "gap": gap, "source_id": example.id, "bundle": bundle})
 
         if rethink:
             # Same current-Actor replica used for rollout; no update has been
             # performed yet. The frozen reference below is ONLY the baseline KL.
-            hint_stats = teacher.score_groups(groups, scorer, tokenizer, cfg, device, hint_settings)
+            hint_stats = teacher.score_groups(groups, scorer, tokenizer, cfg, device, hint_settings, guidance)
             hint_totals = gather(dict(hint_stats))
+        for path, group in zip(paths, groups, strict=True):
+            write_rollouts(path, group, use_sdl=rethink)
         replica.cpu()
         torch.cuda.empty_cache()
         reference.to(device)
         score_reference(groups, ActorScorer(reference), cfg, device)
         reference.cpu()
         torch.cuda.empty_cache()
-        result = update_actor(actor, optimizer, groups, cfg, device, tokenizer.eos_token_id, opsd=opsd)
+        result = update_actor(actor, optimizer, groups, cfg, device, tokenizer.eos_token_id, use_sdl=rethink)
         grpo, norm = result[:2]
         scheduler.step()
+        if rethink:
+            memory.update([entry for entries in gather(added) for entry in entries])
         outcomes = [outcome for group in groups for outcome in group.outcomes]
         metrics = gather({
             "reward": fmean(outcome.reward for outcome in outcomes),
             "valid_fraction": fmean(outcome.valid for outcome in outcomes),
             "grpo": grpo, "grad_norm": norm,
+            **({"sdl": result[2]} if rethink else {}),
         })
         if rank == 0:
             row = {k: fmean(item[k] for item in metrics) for k in metrics[0]}
             row.update(step=step + 1, lr=scheduler.get_last_lr()[0])
             if rethink:
-                row.update(result[2])
+                row.update(sdl_tokens=sum(s.get("sdl_tokens", 0) for s in hint_totals),
+                           experience_entries=len(memory.entries))
                 for name in ("turns", "generated_marker", "native_boundary", "eligible", "hint_trajectories", "api_attempts",
-                             "local_used", "static_fallback", "teacher_turns", "teacher_context_overflow"):
+                             "local_used", "native_fallback", "teacher_turns"):
                     row[f"rethink/{name}"] = sum(s.get(name, 0) for s in hint_totals)
                 row["rethink/trigger_fraction"] = row["rethink/generated_marker"] / max(1, row["rethink/turns"])
             write_json(out / "metrics" / f"step-{step + 1:05d}.json", row)
             print(row, flush=True)
         if (step + 1) % cfg["save_every"] == 0 or step + 1 == total:
             save_checkpoint(out, actor, optimizer, scheduler, step + 1, contract, rank, device,
-                            keep=cfg["keep_checkpoints"])
+                            keep=cfg["keep_checkpoints"], memory=memory if rethink else None)
 
     export_policy(final, actor, replica, processor, total, rank)
 

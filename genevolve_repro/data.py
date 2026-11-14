@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from .common import BENCH, RL, ROOT, jsonl, read_json, relative_image, source_lock, write_json
+from .common import BENCH, RL, ROOT, jsonl, model_ready, read_json, relative_image, source_lock, write_json
 from .sft_export import file_sha256
 
 
@@ -61,3 +61,24 @@ def prepare(work):
     counts = verify_data(work)
     write_json(work / "prepared.json", {"sources": lock, "counts": counts})
     print(counts, flush=True)
+
+
+def prepare_embedding(work):
+    """Fetch the same experience-retrieval model as the pinned GenEvolve baseline."""
+    from huggingface_hub import snapshot_download
+
+    model = source_lock()["embedding"]
+    print(f"Preparing {model['repo']} at {model['revision'][:7]}", flush=True)
+    path = work / "embedding"
+    snapshot_download(model["repo"], revision=model["revision"], local_dir=path,
+                      allow_patterns=["*.json", "*.safetensors", "*.jinja", "merges.txt", "*.model"])
+    if not model_ready(path):
+        raise RuntimeError("The pinned GenEvolve experience-retrieval model is incomplete.")
+    write_json(path / "source.json", model)
+
+
+def embedding_ready(work):
+    path = work / "embedding"
+    source = path / "source.json"
+    return (source.is_file() and read_json(source) == source_lock()["embedding"]
+            and model_ready(path))

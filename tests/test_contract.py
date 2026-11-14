@@ -11,7 +11,7 @@ import torch
 
 import run
 from genevolve_repro.common import BENCH, RL, ROOT, WORLD_SIZE, read_json, source_lock, write_json
-from genevolve_repro.data import prepare
+from genevolve_repro.data import prepare, prepare_embedding
 from genevolve_repro.objectives import advantages, grpo_loss, kl_reward
 from genevolve_repro.route_data import verify_parent
 from genevolve_repro.sft_export import TEXT_SIGNATURE, export_files, sft_manifest
@@ -102,6 +102,18 @@ class ContractTest(unittest.TestCase):
             )
             self.assertFalse((work / "sft").exists())
             self.assertFalse((work / "embedding").exists())
+
+    def test_prepare_embedding_fetches_the_pinned_native_model(self):
+        with TemporaryDirectory() as temp:
+            work = Path(temp)
+            with patch("huggingface_hub.snapshot_download") as download, \
+                    patch("genevolve_repro.data.model_ready", return_value=True):
+                prepare_embedding(work)
+            expected = source_lock()["embedding"]
+            download.assert_called_once_with(
+                expected["repo"], revision=expected["revision"], local_dir=work / "embedding",
+                allow_patterns=["*.json", "*.safetensors", "*.jinja", "merges.txt", "*.model"],
+            )
 
     def test_matched_grpo_clipping_and_reference_kl(self):
         cfg = read_json(ROOT / "configs" / "evolve.json")

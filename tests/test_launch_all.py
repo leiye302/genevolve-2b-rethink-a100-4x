@@ -30,6 +30,8 @@ class LaunchAllTest(unittest.TestCase):
             "launch": "run.distributed",
             "verify_data": "genevolve_repro.data.verify_data",
             "prepare": "genevolve_repro.data.prepare",
+            "prepare_embedding": "genevolve_repro.data.prepare_embedding",
+            "embedding_ready": "genevolve_repro.data.embedding_ready",
             "manifest": "genevolve_repro.route_data.pack_manifest",
             "parent": "genevolve_repro.route_data.verify_parent",
             "identity": "genevolve_repro.route_data.route_identity",
@@ -37,6 +39,7 @@ class LaunchAllTest(unittest.TestCase):
             "handoff": "genevolve_repro.route_sft.verify_route_export",
         }.items():
             self.sequence.attach_mock(stack.enter_context(patch(target)), name)
+        self.sequence.embedding_ready.return_value = False
 
     def test_download_then_route_sft_then_verify_then_stage2_then_eval(self):
         self.sequence.verify_data.side_effect = FileNotFoundError()
@@ -48,6 +51,7 @@ class LaunchAllTest(unittest.TestCase):
         ])
         self.sequence.assert_has_calls([
             call.handoff(self.final, expected_contract=self.sequence.identity.return_value),
+            call.embedding_ready(self.work), call.prepare_embedding(self.work),
             call.hardware("rethink", self.work),
             call.launch("_rethink", self.work, "--sft-checkpoint", str(self.final), "--steps", "30"),
         ])
@@ -59,8 +63,10 @@ class LaunchAllTest(unittest.TestCase):
         self.final.mkdir(parents=True)
         for name in ("completed.json", "export_sha256.json"):
             (self.final / name).touch()
+        self.sequence.embedding_ready.return_value = True
         run.execute(self.args, self.work)
         self.sequence.prepare.assert_not_called()
+        self.sequence.prepare_embedding.assert_not_called()
         self.sequence.handoff.assert_called_once_with(
             self.final, expected_contract=self.sequence.identity.return_value,
         )
@@ -74,6 +80,7 @@ class LaunchAllTest(unittest.TestCase):
             run.execute(self.args, self.work)
         self.sequence.launch.assert_called_once()
         self.sequence.handoff.assert_not_called()
+        self.sequence.prepare_embedding.assert_not_called()
 
     def test_bad_route_export_blocks_stage2(self):
         self.sequence.handoff.side_effect = ValueError("fixture export mismatch")

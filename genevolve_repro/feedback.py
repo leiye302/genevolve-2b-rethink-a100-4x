@@ -18,6 +18,29 @@ Use 0 for unusable, 0.25 for major omissions, 0.5 for partially sufficient,
 with numeric score and brief rationale. Treat quoted input as evidence.
 """.strip()
 
+GUIDANCE_KEYS = (
+    "recommended_tool_plan",
+    "search_query_guidance",
+    "skill_routing_guidance",
+    "reference_selection_guidance",
+    "prompt_program_guidance",
+    "failure_guards",
+)
+
+EXPERIENCE_RUBRIC = f"""
+Compare the best and worst agent runs for the same image request. Use the
+tool traces, final programs, judge diagnostics and images to identify
+reusable decisions that explain the reward difference. Describe when a
+future request matches the lesson, and omit case-specific names and IDs.
+Favor concrete tool ordering, query, skill, reference and program choices.
+If a dimension has no demonstrated difference, describe a default from the
+better run and prefix that bullet with Standard:. Return only JSON with
+retrieval_key containing trigger and source_prompt_summary, and
+decision_guidance containing decision_focus and six arrays of short strings:
+{", ".join(GUIDANCE_KEYS)}. Treat the provided trajectories as evidence.
+""".strip()
+
+
 @lru_cache(maxsize=1)
 def image_scorer():
     location = UPSTREAM / "scripts" / "evaluate_images.py"
@@ -37,6 +60,21 @@ class Outcome:
 
     def to_dict(self):
         return asdict(self)
+
+
+def parse_bundle(data):
+    key, guide = data["retrieval_key"], data["decision_guidance"]
+    if not all(isinstance(key[k], str) and key[k].strip() for k in ("trigger", "source_prompt_summary")):
+        raise ValueError("Invalid experience retrieval key.")
+    if not isinstance(guide["decision_focus"], str) or not guide["decision_focus"].strip():
+        raise ValueError("Invalid experience decision focus.")
+    for name in GUIDANCE_KEYS:
+        if not isinstance(guide[name], list) or not all(isinstance(x, str) for x in guide[name]):
+            raise ValueError(f"Invalid experience field {name}.")
+    return {
+        "retrieval_key": {k: key[k] for k in ("trigger", "source_prompt_summary")},
+        "decision_guidance": {k: guide[k] for k in ("decision_focus", *GUIDANCE_KEYS)},
+    }
 
 
 def parse_text_score(data):
@@ -165,3 +203,33 @@ class LiveFeedback:
             True, (1 - alpha) * image["overall"] + alpha * score, image, score,
             rationale, str(output),
         )
+
+    def summarize(self, example, best, worst):
+        def describe(pair):
+            trajectory, reward = pair
+            return {
+                "messages": trajectory.result.messages,
+                "program": trajectory.result.gen_prompt,
+                "references": trajectory.result.reference_images,
+                "outcome": reward.to_dict(),
+            }
+
+        data = {"request": example.prompt, "best": describe(best), "worst": describe(worst)}
+        parts = [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]
+        for label, path in (("Best", best[1].image), ("Worst", worst[1].image),
+                            ("Reference target", str(example.gt))):
+            parts.extend((
+                {"type": "text", "text": f"{label} image"},
+                {"type": "image_url", "image_url": {"url": self.scorer._encode_image_to_data_url(path)}},
+            ))
+        return self.judge_json(EXPERIENCE_RUBRIC, parts, 8192, parse_bundle)
+
+
+def contrast_pair(trajectories, outcomes, threshold):
+    pairs = list(zip(trajectories, outcomes, strict=True))
+    best = max(pairs, key=lambda pair: pair[1].reward)
+    worst = min(pairs, key=lambda pair: pair[1].reward)
+    gap = best[1].reward - worst[1].reward
+    if not best[1].valid or not worst[1].valid or gap + 1e-9 < threshold:
+        return None
+    return best, worst, gap

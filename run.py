@@ -76,7 +76,7 @@ def run_pipeline(args, work):
         distributed("_route-sft", work, "--parent", str(parent), "--data", str(data))
     else:
         print("Stage 1: found existing Route-SFT export; checking handoff", flush=True)
-    print("Stage 2: GenEvolve GRPO + Actor-routed OPSD", flush=True)
+    print("Stage 2: GenEvolve GRPO + native SDL with Actor-routed hints", flush=True)
     # The same handoff as the standalone subcommand also validates the
     # checkpoint on repeat invocations before any stage-2 workers start.
     execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps,
@@ -99,13 +99,19 @@ def execute(args, work):
         for key in ("SERPER_API_KEY", *keys):
             required_env(key)
     if args.command == "rethink":
+        from genevolve_repro.data import embedding_ready, prepare_embedding
         from genevolve_repro.route_sft import verify_route_export
 
         check_rethink_services()
         verify_route_export(args.sft_checkpoint.resolve(), expected_contract=getattr(args, "route_contract", None))
+        if not embedding_ready(work):
+            prepare_embedding(work)
     if args.command == "prepare":
         from genevolve_repro.data import prepare
         prepare(work)
+    if args.command == "prepare-embedding":
+        from genevolve_repro.data import prepare_embedding
+        prepare_embedding(work)
     if args.command == "route-sft":
         from genevolve_repro.route_data import pack_manifest, recipe
         from genevolve_repro.runtime import preflight
@@ -138,10 +144,11 @@ def route_flags(parser):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenEvolve 2B Route-SFT and Actor-routed OPSD on four GPUs")
+    parser = argparse.ArgumentParser(description="GenEvolve 2B Route-SFT and RETHINK-routed native SDL on four GPUs")
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
+    commands.add_parser("prepare-embedding", help="download GenEvolve's pinned experience-retrieval model")
     sft_flag(commands.add_parser("check-sft", help="check and fingerprint an existing SFT export"))
     pipeline = commands.add_parser("all", help="prepare data and run both method stages")
     route_flags(pipeline)

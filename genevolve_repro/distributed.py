@@ -163,7 +163,7 @@ def restore_rng(value, device):
         torch.cuda.set_rng_state(value["cuda"], device)
 
 
-def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, device, keep=2, verify=False):
+def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, device, keep=2, verify=False, *, memory=None):
     states = gather(get_rng(device))
     with full_state(actor):
         model = actor.state_dict()
@@ -173,15 +173,19 @@ def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, d
         target = folder / f"checkpoint-{step:05d}"
         temporary = Path(mkdtemp(prefix=".checkpoint-", dir=folder))
         payload = temporary / "training.pt"
-        torch.save({
+        state = {
             "step": step, "contract": contract, "actor": model, "optimizer": optimizer_state,
             "scheduler": scheduler.state_dict(), "rng": states,
-        }, payload)
+        }
+        if memory is not None:
+            state["memory"] = memory.entries
+        torch.save(state, payload)
         if verify:
             restored = torch.load(payload, map_location="cpu", mmap=True, weights_only=True)
             if (restored["step"] != step or restored["contract"] != contract
                     or restored["actor"].keys() != model.keys()
                     or restored["optimizer"].keys() != optimizer_state.keys()
+                    or restored.get("memory") != state.get("memory")
                     or len(restored["rng"]) != len(states)):
                 raise ValueError("The newly saved checkpoint is incomplete.")
             del restored

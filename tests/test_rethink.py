@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -11,9 +12,13 @@ from torch.nn import functional as F
 import run
 from genevolve_repro import hints, teacher
 from genevolve_repro.common import ROOT, read_json, write_json
+from genevolve_repro.distributed import load_checkpoint, save_checkpoint
+from genevolve_repro import evolve
 from genevolve_repro.evolve import update_actor
 from genevolve_repro.evaluate import evaluate_case
-from genevolve_repro.policy import Turn, Trajectory
+from genevolve_repro.memory import ExperienceBank
+from genevolve_repro.objectives import advantages, choose_distillation_tokens, loss_terms
+from genevolve_repro.policy import Turn, Trajectory, teacher_prefix
 from genevolve_repro.route_data import MARKER_ID, recipe, source_checkpoint_lock, verify_parent
 from genevolve_repro.route_sft import RouteScorer, verify_route_export
 from genevolve_repro.sft_export import sft_manifest
@@ -22,6 +27,7 @@ from test_contract import fake_export
 
 class ToyTokenizer:
     all_special_ids = [MARKER_ID]
+    eos_token_id = 2
 
     def apply_chat_template(self, messages, **kwargs):
         return list("\n".join(x["content"] for x in messages).encode())
@@ -51,19 +57,25 @@ class RethinkTest(unittest.TestCase):
                     {"role": "user", "content": "Draw a gold bird."}]
         tagged = '<think>Check the evidence.</think>\n<RETHINK><tool_call>{"name":"image_search"}</tool_call>'
         normal = '<think>Use the image.</think>\n<answer>{"gen_prompt":"Sketch the bird"}</answer>'
-        turn1 = Turn([1, 2], [4, MARKER_ID, 2, 3], messages=messages, response=tagged)
+        turn1 = Turn([1, 2], [4, MARKER_ID, 2, 3], old=torch.zeros(4),
+                     messages=messages, response=tagged, action=[2, 3])
         turn2_messages = messages + [{"role": "assistant", "content": tagged},
                                      {"role": "user", "content": "<tool_response>\nIMG_001\n"
                                       "  local_path: /app/cache/private.png\nhttps://example.test/a?sig=example"
                                       "\n</tool_response>"}]
-        turn2 = Turn([1, 3], [1, 8], messages=turn2_messages, response=normal)
-        other = Turn([1], [1, 8], messages=messages, response=normal)
+        turn2 = Turn([1, 3], [1, 8], old=torch.zeros(2),
+                     messages=turn2_messages, response=normal, action=[1])
+        other = Turn([1], [1, 8], old=torch.zeros(2), messages=messages, response=normal, action=[1])
         result = SimpleNamespace(
             messages=turn2_messages + [{"role": "assistant", "content": normal}],
             termination="answer", gt_image="should not be shared")
         traj = Trajectory(result, [turn1, turn2])
         group = SimpleNamespace(trajectories=[traj, Trajectory(result, [other])])
         return group, traj, turn1, turn2, other
+
+    def native_cfg(self):
+        return {**read_json(ROOT / "configs" / "evolve.json"),
+                **read_json(ROOT / "configs" / "genevolve_sdl.json")}
 
     def test_route_mean_ce_and_full_vocabulary_bce_use_the_predictive_index(self):
         torch.manual_seed(0)
@@ -102,19 +114,26 @@ class RethinkTest(unittest.TestCase):
             scored.append((bytes(prefix).decode(), tokens))
             return torch.arange(len(tokens), dtype=torch.float32)
 
-        cfg = read_json(ROOT / "configs" / "evolve.json")
+        cfg = self.native_cfg()
+        tok = ToyTokenizer()
+        guidance = '{"decision_focus":"native prior experience"}'
         with patch("genevolve_repro.teacher.score_turn", side_effect=fake_score):
-            stats = teacher.score_groups([group], None, ToyTokenizer(), cfg, "cpu", None, client)
+            stats = teacher.score_groups([group], None, tok, cfg, "cpu", None, [guidance], client)
         self.assertEqual((stats["turns"], stats["generated_marker"], stats["eligible"],
                           stats["api_attempts"], stats["local_used"], stats["teacher_turns"]), (3, 1, 1, 1, 1, 3))
         self.assertEqual(stats["native_boundary"], 1)
-        self.assertTrue(all("[Privileged Skill Information]" in prefix for prefix, _ in scored))
+        self.assertTrue(all(f"<visual_experience>\n{guidance}\n</visual_experience>" in prefix
+                            for prefix, _ in scored))
         self.assertIn("Use the image result.", scored[0][0])
-        self.assertTrue(all("[Local Decision Hint]" not in prefix for prefix, _ in scored[1:]))
+        self.assertEqual([prefix for prefix, _ in scored[1:]],
+                         [bytes(teacher_prefix(tok, t.messages, guidance)).decode() for t in (later, unrelated)])
         self.assertTrue(all("INJECTION" not in prefix for prefix, _ in scored))
         self.assertEqual([ids for _, ids in scored], [t.tokens for t in (first, later, unrelated)])
         self.assertEqual(original, [(t.prefix, t.tokens, t.messages) for t in (first, later, unrelated)])
         self.assertTrue(all(not t.teacher.requires_grad for t in (first, later, unrelated)))
+        self.assertEqual(first.distill.nonzero().flatten().tolist(), [3])
+        self.assertFalse(later.distill.any())
+        self.assertEqual(stats["sdl_tokens"], 2)
 
     def test_no_api_for_unmarked_and_malformed_marker_is_not_a_second_gate(self):
         group, trajectory, first, _, _ = self.fixture()
@@ -137,19 +156,32 @@ class RethinkTest(unittest.TestCase):
 
     def test_missing_or_ungrounded_hint_falls_back(self):
         group, traj, first, _, _ = self.fixture()
-        with patch("genevolve_repro.teacher.score_turn", return_value=torch.zeros(len(first.tokens))) as score:
-            stats = teacher.score_groups([group], None, ToyTokenizer(), {"context_tokens": 65536, "temperature": 0.7},
-                                         "cpu", None, lambda *_: [({}, 2)])
-        self.assertEqual((stats["eligible"], stats["static_fallback"], stats["local_used"]), (1, 1, 0))
-        prefix, has_local = teacher.preferred_prefix(ToyTokenizer(), first, "x" * 97, 65536, 96)
-        self.assertIsNotNone(prefix)
-        self.assertFalse(has_local)
-        _, has_local = teacher.preferred_prefix(ToyTokenizer(), first, "Use IMG_001.", 65536, 96)
-        self.assertFalse(has_local)
-        _, has_local = teacher.preferred_prefix(ToyTokenizer(), traj.turns[1], "Use IMG_001.", 65536, 96)
+        tok = ToyTokenizer()
+        guidance = "original experience"
+        expected = teacher_prefix(tok, first.messages, guidance)
+        with patch("genevolve_repro.teacher.score_turn", side_effect=lambda _, p, ids, *a: torch.zeros(len(ids))) as score:
+            stats = teacher.score_groups([group], None, tok, self.native_cfg(),
+                                         "cpu", None, [guidance], lambda *_: [({}, 2)])
+        self.assertEqual((stats["eligible"], stats["native_fallback"], stats["local_used"]), (1, 1, 0))
+        self.assertEqual(score.call_args_list[0].args[1], expected)
+        for invalid in ("x" * 97, "Use IMG_001."):
+            self.assertEqual(teacher.preferred_prefix(tok, first, guidance, invalid, 65536, 96), (expected, False))
+        self.assertEqual(teacher.preferred_prefix(tok, first, guidance, "Check the wing.",
+                                                  len(expected) + len(first.tokens), 96), (expected, False))
+        _, has_local = teacher.preferred_prefix(tok, traj.turns[1], guidance, "Use IMG_001.", 65536, 96)
         self.assertTrue(has_local)
-        self.assertEqual(teacher.preferred_prefix(ToyTokenizer(), first, None, 3, 96), (None, False))
+        self.assertEqual(teacher.preferred_prefix(tok, first, guidance, None, 3, 96), (None, False))
         self.assertEqual(score.call_count, 3)
+
+    def test_empty_bank_does_not_create_a_static_teacher(self):
+        group, _, first, later, unrelated = self.fixture()
+        with patch("genevolve_repro.teacher.score_turn", return_value=torch.zeros(len(first.tokens))) as score:
+            stats = teacher.score_groups([group], None, ToyTokenizer(), self.native_cfg(),
+                                         "cpu", None, [None], lambda *_: [({1: "Search for the wing."}, 1)])
+        self.assertEqual((stats["local_used"], stats["teacher_turns"]), (1, 1))
+        self.assertNotIn(b"<visual_experience>", bytes(score.call_args.args[1]))
+        self.assertIsNone(later.teacher)
+        self.assertIsNone(unrelated.teacher)
 
     def test_api_request_contains_only_redacted_trajectory_and_parses_selected_steps(self):
         _, trajectory, _, _, _ = self.fixture()
@@ -184,36 +216,117 @@ class RethinkTest(unittest.TestCase):
                          {"turns": 2, "marker_turns": 0, "native_boundary_turns": 0})
         self.assertEqual(marked, plain)
 
-    def test_sdar_gradient_gate_is_detached_even_when_teacher_tensor_has_grad(self):
-        student = torch.tensor([-2.0, -2.0, -2.0], requires_grad=True)
-        target = torch.tensor([-1.0, -2.0, -3.0], requires_grad=True)
-        terms, gate, gap = teacher.sdar_token_terms(student, target, 5.0)
-        torch.testing.assert_close(gate, torch.sigmoid(5 * (target.detach() - student.detach())))
-        torch.testing.assert_close(terms.detach(), gate * gap)
-        terms.mean().backward()
+    def test_native_sdl_only_top_ten_percent_action_tokens_and_detached_teacher(self):
+        cfg = self.native_cfg()
+        target = torch.tensor([-20.0, -1.0, -3.0, -5.0], requires_grad=True)
+        turn = Turn([1], [1, MARKER_ID, 2, 3], old=torch.tensor([-2.0, -2.0, -2.0, -2.0]),
+                    teacher=target.detach(), action=[2, 3])
+        self.assertEqual(choose_distillation_tokens([turn], cfg["sdl_top_fraction"]), 1)
+        self.assertEqual(turn.distill.tolist(), [False, False, False, True])
+        turn.teacher = target
+        student = torch.tensor([-2.2, -2.0, -1.6, -1.7], requires_grad=True)
+        _, sdl = loss_terms(student, turn, 0.6, cfg)
+        d = student[-1] - target[-1].detach()
+        ratio = (student[-1] - turn.old[-1]).exp().clamp(max=2.0)
+        expected = (ratio * (-d).expm1().add(d).clamp(0, 10)).clamp(max=10)
+        torch.testing.assert_close(sdl, expected)
+        sdl.backward()
         self.assertIsNone(target.grad)
-        torch.testing.assert_close(student.grad, -gate / 3)
+        self.assertEqual(student.grad[:3].tolist(), [0.0] * 3)
+        self.assertNotEqual(student.grad[-1].item(), 0.0)
 
     def test_mixed_turn_update_keeps_all_grpo_tokens(self):
         torch.manual_seed(0)
         model = torch.nn.Linear(1, 1, bias=False)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        a = Turn([1], [1, 1], old=torch.zeros(2), reference=torch.zeros(2), teacher=torch.zeros(2))
+        a = Turn([1], [1, 1], old=torch.zeros(2), reference=torch.zeros(2),
+                 teacher=torch.tensor([-0.2, -1.0]), distill=torch.tensor([False, True]))
         b = Turn([1], [1, 1, 1], old=torch.zeros(3), reference=torch.zeros(3))
         group = SimpleNamespace(trajectories=[SimpleNamespace(turns=[a]), SimpleNamespace(turns=[b])],
                                 outcomes=[SimpleNamespace(reward=1), SimpleNamespace(reward=0)])
-        cfg = read_json(ROOT / "configs" / "evolve.json")
+        cfg = self.native_cfg()
 
         def scorer(actor, prefix, tokens, temperature, device):
             return actor(torch.ones(len(tokens), 1)).flatten() * 0
 
         with patch("genevolve_repro.evolve.score_turn", side_effect=scorer) as score:
-            _, norm, opsd = update_actor(model, optimizer, [group], cfg, torch.device("cpu"), 2,
-                                        opsd=teacher.recipe())
+            grpo, norm, sdl = update_actor(model, optimizer, [group], cfg, torch.device("cpu"), 2,
+                                          use_sdl=True)
             self.assertEqual(score.call_count, 2)
-        self.assertEqual(opsd["sdar/tokens"], 2)
-        self.assertEqual(opsd["sdar/gate_mean"], 0.5)
+        positive, negative = advantages([1, 0])
+        self.assertAlmostEqual(grpo, -(2 * positive + 3 * negative) / 2)
+        self.assertAlmostEqual(sdl, (torch.exp(torch.tensor(-1.0)).item()) / 2)
         self.assertEqual(norm, 0.0)
+
+    def test_native_experience_bank_survives_checkpoint(self):
+        memory = ExperienceBank(500)
+        bundle = {"decision_guidance": {"decision_focus": "check the wing pattern"}}
+        memory.update([{"vector": [0.0, 1.0], "gap": 0.5, "source_id": "fixture", "bundle": bundle}])
+        model = ToyPolicy()
+        optimizer = torch.optim.AdamW(model.parameters())
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 2)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, model, optimizer, scheduler, 1, {"algorithm": "gen-evolve"}, 0,
+                            torch.device("cpu"), verify=True, memory=memory)
+            state = load_checkpoint(root / "checkpoint-00001")
+            self.assertEqual(state["memory"], memory.entries)
+            self.assertEqual(ExperienceBank(500, state["memory"]).retrieve([0.0, 1.0]),
+                             json.dumps(bundle["decision_guidance"]))
+
+    def test_two_stage2_updates_use_native_experience_only_after_writing_it(self):
+        device = torch.device("cpu")
+        tok = ToyTokenizer()
+        example = SimpleNamespace(id="fixture", prompt="Draw a gold bird.")
+        actor = torch.nn.Linear(1, 1, bias=False)
+        bundle = {"decision_guidance": {"decision_focus": "native experience fixture"}}
+        feedback = SimpleNamespace(summarize=lambda *args: bundle)
+        teacher_inputs = []
+
+        def rollout(agent, feedback, example, path, count):
+            self.assertEqual(count, 6)
+            group, _, _, _, _ = self.fixture()
+            outcomes = [SimpleNamespace(reward=r, valid=True) for r in (0.9, 0.1)]
+            return evolve.Group(example, group.trajectories, outcomes)
+
+        def token_scores(scorer, prefix, tokens, temperature, device):
+            return scorer(torch.ones(len(tokens), 1)).flatten()
+
+        def teacher_scores(scorer, prefix, tokens, temperature, device):
+            teacher_inputs.append(bytes(prefix).decode())
+            return token_scores(scorer, prefix, tokens, temperature, device) - 0.25
+
+        def request(settings, cfg, jobs):
+            self.assertTrue(jobs)
+            self.assertTrue(all(selected == [1] for _, selected in jobs))
+            return [({1: "Check the wing shape."}, 1) for _ in jobs]
+
+        with TemporaryDirectory() as temp, patch.multiple(
+            evolve, load_upstream=lambda: None, required_env=lambda _: "offline-fixture",
+            embedding_ready=lambda _: True, examples=lambda *_: [example] * 2575, verify_split=lambda *_: "fixture-sha",
+            verify_route_export=lambda _: {"completed": 594}, make_sharded_actor=lambda *args: actor,
+            load_model=lambda *args: deepcopy(actor), ActorScorer=lambda model: model,
+            copy_actor=lambda src, dst: dst.load_state_dict(src.state_dict()), Embedder=lambda *_: lambda _: [1.0],
+            LiveFeedback=lambda *args: feedback, make_agent=lambda *a, **k: None, gather_group=rollout,
+            score_turn=token_scores, write_rollouts=lambda *a, **k: None, export_policy=lambda *args: None,
+        ), patch("transformers.AutoTokenizer.from_pretrained", return_value=tok), \
+                patch("transformers.AutoProcessor.from_pretrained"), \
+                patch("genevolve_repro.teacher.verify_marker"), \
+                patch("genevolve_repro.teacher.score_turn", side_effect=teacher_scores), \
+                patch("genevolve_repro.hints.settings_from_env", return_value=SimpleNamespace(identity=lambda: {})), \
+                patch("genevolve_repro.hints.request_trajectories", side_effect=request):
+            root = Path(temp)
+            evolve._loop(root, root / "route", 0, 4, device, 2, rethink=True)
+            saved = load_checkpoint(root / "rethink" / "checkpoint-00002")
+            metrics1 = read_json(root / "rethink" / "metrics" / "step-00001.json")
+            metrics2 = read_json(root / "rethink" / "metrics" / "step-00002.json")
+            self.assertEqual((metrics1["experience_entries"], metrics2["experience_entries"]), (2, 4))
+            self.assertEqual((metrics1["sdl_tokens"], metrics2["sdl_tokens"]), (2, 4))
+            self.assertEqual(len(saved["memory"]), 4)
+            self.assertNotIn("sdar_coef", saved["contract"]["config"])
+            self.assertTrue(all("<visual_experience>" not in text for text in teacher_inputs[:2]))
+            self.assertTrue(all("<visual_experience>" in text for text in teacher_inputs[2:]))
+            self.assertEqual(sum("<local_decision_hint>" in text for text in teacher_inputs), 4)
 
     def test_stage2_clamps_to_exact_complete_route_export(self):
         cfg = recipe()

@@ -1,7 +1,6 @@
-"""GenEvolve adapter for the existing SDAR gate and Actor-routed local skill."""
+"""Add Actor-routed local hints to the native GenEvolve experience teacher."""
 
 from collections import Counter
-from functools import lru_cache
 import json
 import re
 
@@ -9,7 +8,8 @@ import torch
 
 from . import hints
 from .common import ROOT, read_json
-from .policy import score_turn, tokenize_history
+from .objectives import choose_distillation_tokens
+from .policy import score_turn, teacher_prefix, tokenize_history
 from .route_data import MARKER, MARKER_ID
 
 NATIVE_ROUTE = re.compile(
@@ -21,11 +21,6 @@ IMAGE_ID = re.compile(r"\bIMG_\d+\b")
 
 def recipe():
     return read_json(ROOT / "configs" / "rethink.json")
-
-
-@lru_cache(maxsize=1)
-def static_skill():
-    return (ROOT / "configs" / "static_skill.txt").read_text(encoding="utf-8").strip()
 
 
 def verify_marker(tokenizer):
@@ -48,19 +43,6 @@ def is_routed(turn):
     return True
 
 
-def turn_prefix(tokenizer, turn, hint=None):
-    messages = [m.copy() for m in turn.messages]
-    system = messages[0]
-    before, sep, after = system["content"].partition("# Tools")
-    if system["role"] != "system" or not sep:
-        raise ValueError("Expected the pinned native GenEvolve system prompt.")
-    guidance = f"[Privileged Skill Information]\n{static_skill()}\n"
-    if hint is not None:
-        guidance += f"\n[Local Decision Hint]\n{hint}\n"
-    system["content"] = f"{before}\n{guidance}\n{sep}{after}"
-    return tokenize_history(tokenizer, messages)
-
-
 def plan_hints(groups, cfg, settings, client=None):
     stats = Counter()
     jobs = []
@@ -73,8 +55,7 @@ def plan_hints(groups, cfg, settings, client=None):
                     stats["generated_marker"] += 1
                     if is_routed(turn):
                         stats["native_boundary"] += 1
-                    # Raw generated marker is the only routing signal, as in
-                    # the paired Actor-routed method. Format is telemetry.
+                    # As in ALFWorld, only the Actor's token decides routing.
                     selected.append(n)
             if selected:
                 stats["eligible"] += len(selected)
@@ -91,47 +72,58 @@ def plan_hints(groups, cfg, settings, client=None):
     return incoming, stats
 
 
-def preferred_prefix(tokenizer, turn, hint, context, hint_max_tokens):
-    """Return a teacher prefix, with static-only fallback and no truncation."""
+def preferred_prefix(tokenizer, turn, guidance, hint, context, hint_max_tokens):
+    """Preserve the exact native Teacher unless a local hint can be added."""
     if hint is not None:
         ids = tokenizer.encode(hint, add_special_tokens=False)
         observed = set().union(*(set(IMAGE_ID.findall(m["content"])) for m in turn.messages
                                  if m["role"] == "user" and m["content"].startswith("<tool_response>")))
         if (0 < len(ids) <= hint_max_tokens and not set(ids) & set(tokenizer.all_special_ids)
                 and set(IMAGE_ID.findall(hint)) <= observed):
-            prefix = turn_prefix(tokenizer, turn, hint=hint)
+            # Keep retrieved experience byte-for-byte; only add one local block
+            # to a copy of this row's native Teacher messages. An empty bank is
+            # unchanged for unmarked turns; a marked turn may have a hint alone.
+            messages = [dict(message) for message in turn.messages]
+            system = messages[0]["content"]
+            before, sep, after = system.partition("# Tools")
+            if not sep:
+                raise ValueError("The pinned agent's system prompt has no # Tools section.")
+            messages[0]["content"] = (
+                f"{before}\n<local_decision_hint>\n{hint}\n</local_decision_hint>\n\n{sep}{after}"
+            )
+            prefix = teacher_prefix(tokenizer, messages, guidance) if guidance else tokenize_history(tokenizer, messages)
             if len(prefix) + len(turn.tokens) <= context:
                 return prefix, True
-    prefix = turn_prefix(tokenizer, turn)
+    if not guidance:
+        return None, False
+    prefix = teacher_prefix(tokenizer, turn.messages, guidance)
     if len(prefix) + len(turn.tokens) > context:
         return None, False
     return prefix, False
 
 
 @torch.no_grad()
-def score_groups(groups, scorer, tokenizer, cfg, device, settings, client=None):
+def score_groups(groups, scorer, tokenizer, cfg, device, settings, guidance_by_group, client=None):
     r = recipe()
     selected, stats = plan_hints(groups, r, settings, client=client)
-    for group in groups:
+    for group, guidance in zip(groups, guidance_by_group, strict=True):
         for trajectory in group.trajectories:
             for turn in trajectory.turns:
-                prefix, local = preferred_prefix(tokenizer, turn, selected.get(id(turn)), cfg["context_tokens"],
-                                                 r["hint_max_tokens"])
+                turn.teacher = None
+                if not turn.action:
+                    # Native SDL scores only turns with a native action span.
+                    continue
+                hint = selected.get(id(turn))
+                if not (guidance or hint):
+                    continue
+                prefix, local = preferred_prefix(tokenizer, turn, guidance, hint,
+                                                 cfg["context_tokens"], r["hint_max_tokens"])
                 if prefix is None:
-                    stats["teacher_context_overflow"] += 1
                     continue
                 if local:
                     stats["local_used"] += 1
                 turn.teacher = score_turn(scorer, prefix, turn.tokens, cfg["temperature"], device).detach().cpu()
                 stats["teacher_turns"] += 1
-    stats["static_fallback"] = stats["eligible"] - stats["local_used"]
+            stats["sdl_tokens"] += choose_distillation_tokens(trajectory.turns, cfg["sdl_top_fraction"])
+    stats["native_fallback"] = stats["eligible"] - stats["local_used"]
     return stats
-
-
-def sdar_token_terms(student, teacher, beta):
-    teacher = teacher.to(student.device).detach()
-    if teacher.shape != student.shape:
-        raise ValueError("Teacher must score the identical sampled response token IDs.")
-    gap = teacher - student
-    gate = torch.sigmoid(beta * gap.detach())
-    return gate * gap, gate, gap.detach()
