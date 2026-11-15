@@ -17,7 +17,8 @@ from .distributed import (
 from .policy import ActorScorer
 from .route_data import (
     MARKER_ID, load_pack, pack_manifest, parent_tokenizer, recipe, register_marker,
-    route_identity, source_checkpoint_lock, verify_parent, verify_parent_identity, verify_tokenizer,
+    route_identity, source_checkpoint_lock, verify_artifact_identity, verify_parent,
+    verify_parent_identity, verify_tokenizer,
 )
 from .sft_export import sft_manifest
 
@@ -111,9 +112,10 @@ def verify_route_export(path, cfg=None, expected_contract=None):
     done = read_json(path / "completed.json") if (path / "completed.json").is_file() else {}
     identity = done.get("contract") or {}
     if (done.get("algorithm") != "route-sft" or done.get("step") != total
-            or identity.get("config") != cfg or identity.get("manifest_sha256") != cfg["manifest_sha256"]
+            or identity.get("config") != cfg
             or identity.get("route_data_source_sha256") != source_checkpoint_lock()):
         raise ValueError("Stage 2 must start from the complete two-epoch Route-SFT HF export.")
+    verify_artifact_identity(identity.get("manifest_sha256"), identity.get("artifact_sha256"), cfg)
     verify_parent_identity(identity.get("parent"), cfg)
     if expected_contract is not None and identity != expected_contract:
         raise ValueError("Route-SFT export does not match the supplied 2B parent and v3 pack; use a new WORK.")

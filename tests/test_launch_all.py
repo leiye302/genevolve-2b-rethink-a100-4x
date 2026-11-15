@@ -5,7 +5,7 @@ from pathlib import Path
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import run
 
@@ -23,6 +23,7 @@ class LaunchAllTest(unittest.TestCase):
         stack.enter_context(redirect_stdout(StringIO()))
         self.sequence = Mock()
         for name, target in {
+            "public_pack": "genevolve_repro.route_release.prepare_route",
             "upstream": "run.load_upstream",
             "services": "run.check_rethink_services",
             "env": "run.required_env",
@@ -40,6 +41,7 @@ class LaunchAllTest(unittest.TestCase):
         }.items():
             self.sequence.attach_mock(stack.enter_context(patch(target)), name)
         self.sequence.embedding_ready.return_value = False
+        self.sequence.public_pack.return_value = self.pack
 
     def test_download_then_route_sft_then_verify_then_stage2_then_eval(self):
         self.sequence.verify_data.side_effect = FileNotFoundError()
@@ -73,6 +75,23 @@ class LaunchAllTest(unittest.TestCase):
         self.sequence.launch.assert_called_once_with(
             "_rethink", self.work, "--sft-checkpoint", str(self.final), "--steps", "30",
         )
+        self.sequence.public_pack.assert_not_called()
+
+    def test_all_uses_public_pack_when_no_override_is_given(self):
+        self.args.data = None
+        run.execute(self.args, self.work)
+        self.sequence.public_pack.assert_called_once_with(self.work)
+        self.sequence.manifest.assert_called_once_with(self.pack, ANY)
+        self.sequence.launch.assert_any_call("_route-sft", self.work, "--parent", str(self.parent),
+                                             "--data", str(self.pack))
+
+    def test_pack_failure_stops_before_training(self):
+        self.args.data = None
+        self.sequence.public_pack.side_effect = ValueError("dataset checksum mismatch")
+        with self.assertRaisesRegex(ValueError, "dataset checksum mismatch"):
+            run.execute(self.args, self.work)
+        self.sequence.hardware.assert_not_called()
+        self.sequence.launch.assert_not_called()
 
     def test_stage1_exit_failure_never_starts_stage2(self):
         self.sequence.launch.side_effect = CalledProcessError(1, "fixture")

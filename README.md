@@ -23,11 +23,11 @@
 
 封版包共 2,376 条：1,782 Good / 594 Bad。Bad 含 394 条自然错误和 200 条同状态构造对照（与源 Good 同 batch）。Good 保留真实采样动作；Bad 使用原生 `<tool_call>…</tool_call>` 或 `<answer>…</answer>` 纠正后缀，前面加一个注册后的 `<RETHINK>`。训练与 rollout 保持同一文本工具历史，不给 Actor 插入额外图像观察或换解析器。
 
-**数据来源与训练起点不同。** 保留之前选定的复审 v3 数据，其离线轨迹由 GenEvolve 8B 采集，不声称是 2B 自采。分开记录 8B 采集来源和 2B 实际训练权重的 SHA-256。启动时用传入的 2B SFT-550 tokenizer 核对全部历史 token、边界和标签解码；若不一致就报错，不重分词、不跳过样本。
+**数据来源与训练起点不同。** 复审 v3 数据的离线轨迹由 GenEvolve 8B 采集；本实验从 2B SFT-550 训练。默认使用[公开版训练包](DATASET.md)：只脱敏历史工具响应中的机器路径、访问参数和联系方式，重新计算受影响的历史 token 与边界。样本、批序、当前 reasoning 和受监督 token 不变。启动时用实际 2B SFT-550 tokenizer 核对全部历史 token、边界和解码；若不一致就报错，不临时重分词或跳过样本。
 
 - mask 至 `</think>\n`（含分隔符），只监督动作后缀及 EOS。用首个目标 token 的预测位置，在**全词表**上算 marker BCE；逐样本平均后缀 CE + 0.1 × BCE，无 reasoning CE、无 KL、无 LoRA。
 - 按原序扫描 297 个固定批次两遍：全局 8，四卡 × micro 1 × 累积 2，**594 updates**。LR 2e-6，前 10% warmup、cosine、AdamW (0.9, 0.95)、weight decay 0.01、clip 1.0、seed 0。语言参数全参训练，视觉塔不动。
-- 最长 11,223 tokens；使用 12,288 上限，超长直接报错，不重分词或截断。每轮存原生可续训状态和 HF 导出。该封版包只供训练，没有另造 SFT val split；日志中的 train loss 和给定前缀 marker 概率不是自由生成指标。
+- 公开包最长 11,081 tokens（原档 11,223）；使用 12,288 上限，超长直接报错，不现场重分词或截断。每轮存原生可续训状态和 HF 导出。该封版包只供训练，没有另造 SFT val split；日志中的 train loss 和给定前缀 marker 概率不是自由生成指标。
 
 ## 二阶段：GenEvolve GRPO + SDL，Actor 路由局部 hint
 
@@ -44,12 +44,12 @@ Teacher 分数进入原版 GenEvolve 的 action-span token 选择与 SDL（仍�
 
 Linux x86-64、Python 3.11、CUDA 12.8 和 C/C++ 构建工具。沿用对照的四张 A100 80GB、FSDP 和 CPU offload；使用同版独立渲染服务，或另开渲染机执行 `bash scripts/setup.sh --renderer`、`bash scripts/serve_renderer.sh`。每个训练阶段首次启动至少需 100 GiB 可用空间；两阶段同盘时还要计入已保存的一阶段产物、数据、生成图以及渲染器缓存。实际峰值尚未在四卡验证。
 
-运行方提供两个独立输入，不从作者机器读取：
+运行方只需提供与对照组相同的起点权重；训练数据可公开下载：
 
 - `PARENT`：对照组实际使用的 **GenEvolve 2B checkpoint-550 完整 HF 导出**，可指向 [2B 复现仓库](https://github.com/leiye302/GenEvolve-2B-Reproduction/tree/57263f0583c633c3d515913b9935c3850cdf798e)的 `WORK/sft` 或同文件的 `checkpoint-550`。须含权重、tokenizer、processor、`trainer_state.json`；不能传原始基模、8B、二阶段权重或只有 ZeRO 状态的目录。
-- `ROUTE_DATA`：复审封版目录 `route_sft_6g2b_final_v3_reviewed`，必须包含 `manifest.json`、`train.jsonl`、`batches.jsonl`，与代码分开交付。仓库只接受该包的 SHA；旧 v2 不兼容。若此前用 v2 启动过训练，请用新的 `WORK` 目录，不要跨数据版本续训。`check-route` 核对文件 SHA、真实 tokenizer 输入和解码，不占卡、不调用 API。
+- **Route-SFT 数据**：[GitHub Release 训练包](https://github.com/leiye302/genevolve-2b-rethink-a100-4x/releases/tag/route-sft-reviewed-v3-public)，不需要账号权限或另找本地文件。`prepare-route` 下载、校验并解压到 `WORK/route_data/route-sft-reviewed-v3-public`；`all` 和 `route-sft` 缺数据时也会自动下载。如果服务器连不上 GitHub Releases，可在联网机器上下载并解压，再用 `--data /path/to/extracted-pack` 指定。
 
-权重和 v3 训练包不在公开 Git 仓库内。从实验交接取得这两个输入，放在运行机器可访问的目录。可用本仓库的 `check-sft --sft-checkpoint "$PARENT"` 分别读取方法和基线的 HF 导出，逐文件核对 SHA-256。方法端也会把指纹记入运行清单，续训和自动衔接必须保持同一份 2B 起点。[v3 的 8B 采集来源指纹](configs/route_data_source_8b_sha256.json)仅用于校验数据，不用于加载模型。
+用 `check-sft --sft-checkpoint "$PARENT"` 分别检查方法和基线的 HF 导出并核对权重 SHA-256。[v3 的 8B 采集来源指纹](configs/route_data_source_8b_sha256.json)仅用于校验数据。已经使用原始 v3 开训时，继续传原来的 `--data`；公开版使用新的 `WORK`，不能跨数据指纹续训。旧 v2 不兼容。
 
 ```bash
 git clone https://github.com/leiye302/genevolve-2b-rethink-a100-4x.git
@@ -58,9 +58,9 @@ bash scripts/setup.sh
 source .venv/bin/activate
 export WORK=/path/to/independent-run
 export PARENT=/path/to/genevolve-2b-sft/checkpoint-550
-export ROUTE_DATA=/path/to/route_sft_6g2b_final_v3_reviewed
+python run.py --work "$WORK" prepare-route
 # 使用自己的四张获配 GPU；由调度器指定时保持它的映射。
-python run.py check-route --parent "$PARENT" --data "$ROUTE_DATA"
+python run.py --work "$WORK" check-route --parent "$PARENT"
 ```
 
 二阶段和评测需要 Serper + 基线 Judge；二阶段原有的视觉经验提取也继续使用基线 Judge。方法训练额外需要局部 hint API（`glm-5.3-flash`、低思考、HTTPS OpenAI-compatible chat completions；OpenCode Go 每条轨迹使用独立会话 ID）。先确认服务商允许接收训练轨迹。**局部 hint 请求**只带本条 rollout 的文本证据和指定步号，不带真值图或本地图片路径；**原版经验提取**按既有实现向 Judge 提供 best/worst 渲染及参考目标图。凭据通过环境注入，不写进 Git 或命令行。详见 [环境变量模板](configs/services.env.example)。
@@ -73,12 +73,12 @@ read -rsp 'Judge key: ' JUDGE_API_KEY; printf '\n'
 read -rsp 'Hint key: ' GENEVOLVE_HINT_API_KEY; printf '\n'
 export SERPER_API_KEY JUDGE_API_KEY GENEVOLVE_HINT_API_KEY
 # 准备官方数据 → 一阶段 Route-SFT → 核验 594 步导出 → 二阶段
-python run.py --work "$WORK" all --parent "$PARENT" --data "$ROUTE_DATA"
+python run.py --work "$WORK" all --parent "$PARENT"
 # 可选独立终评；或在 all 命令末尾加 --eval，训练完成后自动做全量终评。
 python run.py --work "$WORK" eval --split bench
 ```
 
-只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT" --data "$ROUTE_DATA"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"`。二阶段入口自动准备固定版本的 Qwen3-Embedding-0.6B，也可用 `prepare-embedding` 提前下载。重新执行 `all` 会复用已验收的官方数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
+只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00594"`。二阶段入口自动准备固定版本的 Qwen3-Embedding-0.6B，也可用 `prepare-embedding` 提前下载。重新执行 `all` 会复用已验收的数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
 
 同 2B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，不调用 hint API；不带 RETHINK 的 GenEvolve 对照请用独立的 2B 复现仓库。原冷启动和 Route-SFT 两轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启使用原命令、同一 WORK、数据、起点、计划步数与服务配置；二阶段断点保存原版经验库。旧版 SDAR 二阶段断点不能接续到这版；相同协议下已验收的 2B Route-SFT 导出可复用。不要把 8B 的断点用于 2B。
 

@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 from genevolve_repro.common import ROOT, WORLD_SIZE, load_upstream, required_env
-from genevolve_repro.sft_export import export_files, sft_manifest
+from genevolve_repro.sft_export import export_files, file_sha256, sft_manifest
 
 
 def distributed(subcommand, work, *arguments):
@@ -44,6 +44,13 @@ def validate_steps(steps):
         raise ValueError("--steps must be positive.")
 
 
+def route_data_folder(work, given):
+    if given is not None:
+        return given.resolve()
+    from genevolve_repro.route_release import prepare_route
+    return prepare_route(work)
+
+
 def run_pipeline(args, work):
     """Run the two method stages under the caller's single work-directory lock."""
     from genevolve_repro.data import prepare, verify_data
@@ -55,9 +62,10 @@ def run_pipeline(args, work):
     load_upstream()
     cfg = recipe()
     parent = args.parent.resolve()
-    data = args.data.resolve()
+    parent_id = verify_parent(parent, cfg)
+    data = route_data_folder(work, args.data)
     pack = pack_manifest(data, cfg)
-    contract = route_identity(data, pack, cfg, verify_parent(parent, cfg))
+    contract = route_identity(data, pack, cfg, parent_id)
     total = cfg["batches_per_epoch"] * cfg["epochs"]
     route_export = work / "route_sft" / f"hf-step-{total:05d}"
     route_ready = all((route_export / name).is_file() for name in ("completed.json", "export_sha256.json"))
@@ -109,6 +117,13 @@ def execute(args, work):
     if args.command == "prepare":
         from genevolve_repro.data import prepare
         prepare(work)
+    if args.command == "prepare-route":
+        from genevolve_repro.route_data import load_pack, recipe
+
+        folder = route_data_folder(work, None)
+        rows, batches = load_pack(folder, recipe())
+        print(json.dumps({"route_data": str(folder), "rows": len(rows), "batches": len(batches),
+                          "max_tokens": max(len(row["input_ids"]) for row in rows), "verified": True}, indent=2))
     if args.command == "prepare-embedding":
         from genevolve_repro.data import prepare_embedding
         prepare_embedding(work)
@@ -116,9 +131,10 @@ def execute(args, work):
         from genevolve_repro.route_data import pack_manifest, recipe
         from genevolve_repro.runtime import preflight
 
-        pack_manifest(args.data.resolve(), recipe())
+        data = route_data_folder(work, args.data)
+        pack_manifest(data, recipe())
         preflight("route-sft", work)
-        distributed("_route-sft", work, "--parent", str(args.parent.resolve()), "--data", str(args.data.resolve()))
+        distributed("_route-sft", work, "--parent", str(args.parent.resolve()), "--data", str(data))
     if args.command in {"grpo", "rethink"}:
         from genevolve_repro.runtime import preflight
 
@@ -137,9 +153,9 @@ def sft_flag(parser):
                         help="Qwen3-VL-2B HF export; Route-SFT final for rethink, baseline SFT-550 for GRPO")
 
 
-def route_flags(parser):
-    parser.add_argument("--data", required=True, type=Path,
-                        help="sealed Route-SFT directory (manifest.json, train.jsonl, batches.jsonl)")
+def route_flags(parser, *, internal=False):
+    parser.add_argument("--data", required=internal, type=Path,
+                        help="verified Route-SFT directory (default: download the public reviewed v3 pack)")
     parser.add_argument("--parent", required=True, type=Path, help="matching GenEvolve 2B SFT checkpoint-550 HF export")
 
 
@@ -148,6 +164,7 @@ def main():
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
+    commands.add_parser("prepare-route", help="download and check the public Route-SFT pack (CPU only)")
     commands.add_parser("prepare-embedding", help="download GenEvolve's pinned experience-retrieval model")
     sft_flag(commands.add_parser("check-sft", help="check and fingerprint an existing SFT export"))
     pipeline = commands.add_parser("all", help="prepare data and run both method stages")
@@ -155,7 +172,7 @@ def main():
     pipeline.add_argument("--steps", type=int, help="planned stage-2 updates (default: 322, same as the baselines)")
     pipeline.add_argument("--eval", action="store_true", help="also score the final policy on the full benchmark")
     for name in ("check-route", "route-sft", "_route-sft"):
-        route_flags(commands.add_parser(name))
+        route_flags(commands.add_parser(name), internal=name == "_route-sft")
     for name in ("grpo", "_grpo", "rethink", "_rethink"):
         stage = commands.add_parser(name)
         sft_flag(stage)
@@ -176,11 +193,14 @@ def main():
 
         cfg = recipe()
         try:
-            m = pack_manifest(args.data.resolve(), cfg)
             parent = verify_parent(args.parent.resolve(), cfg)
-            rows, batches = load_pack(args.data.resolve(), cfg, m)
+            data = route_data_folder(work, args.data)
+            m = pack_manifest(data, cfg)
+            rows, batches = load_pack(data, cfg, m)
             verify_tokenizer(rows, parent_tokenizer(args.parent.resolve()))
-            print(json.dumps({"parent": parent, "trajectory_source": "8B",
+            print(json.dumps({"parent": parent, "trajectory_source": "8B", "route_data": str(data),
+                              "route_data_variant": m.get("release_variant", "reviewed-v3-original"),
+                              "route_manifest_sha256": file_sha256(data / "manifest.json"),
                               "rows": len(rows), "batches": len(batches), "updates": len(batches) * cfg["epochs"],
                               "max_tokens": max(len(row["input_ids"]) for row in rows),
                               "all_online_prefixes_matched": True}, indent=2))

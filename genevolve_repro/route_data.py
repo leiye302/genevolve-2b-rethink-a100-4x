@@ -6,6 +6,7 @@ import re
 
 from .actor_text import ACTOR_TEXT_PROTOCOL, decode_actor_response
 from .common import ROOT, jsonl, read_json
+from .route_release import release_lock
 from .sft_export import MODEL_FAMILY, REQUIRED, file_sha256, sft_manifest
 
 MARKER = "<RETHINK>"
@@ -22,20 +23,41 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def release_artifacts(digest, cfg):
+    """Return the public files for this digest, or None for the original pack."""
+    if digest == cfg["manifest_sha256"]:
+        return None
+    files = release_lock()["files"]
+    require(digest == files["manifest.json"]["sha256"], "Route-SFT manifest SHA-256 mismatch.")
+    return {name: files[name]["sha256"] for name in ("train.jsonl", "batches.jsonl")}
+
+
+def verify_artifact_identity(digest, artifacts, cfg):
+    public = release_artifacts(digest, cfg)
+    if public is not None:
+        require(artifacts == public, "Route-SFT release files do not match the pinned SHA-256.")
+
+
 def pack_manifest(folder, cfg):
     path = Path(folder) / "manifest.json"
     require(path.is_file(), f"Expected manifest.json for the sealed {cfg['schema']} pack.")
-    require(file_sha256(path) == cfg["manifest_sha256"], "Route-SFT manifest SHA-256 mismatch.")
+    digest = file_sha256(path)
+    public = release_artifacts(digest, cfg)
     m = read_json(path)
     for key, expected in {
         "schema": cfg["schema"], "batches": cfg["batches_per_epoch"],
         "good": cfg["batches_per_epoch"] * cfg["good_per_batch"],
         "bad": cfg["batches_per_epoch"] * cfg["bad_per_batch"],
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL, "marker_id": MARKER_ID,
-        "eos_id": EOS_ID, "ordered_batches": True, "retokenized_input_history": False,
+        "eos_id": EOS_ID, "ordered_batches": True, "retokenized_input_history": public is not None,
         "history_truncation": False, "official_split_overlap_exact_normalized": 0,
     }.items():
         require(m.get(key) == expected, f"Unexpected Route-SFT manifest field: {key}.")
+    if public is not None:
+        require(m.get("release_variant") == "reviewed-v3-public"
+                and m.get("original_manifest_sha256") == cfg["manifest_sha256"]
+                and m.get("supervision_identical_to_reviewed_v3") is True
+                and m.get("artifact_sha256") == public, "Public Route-SFT provenance differs.")
     require(m["checkpoint550_file_sha256"] == source_checkpoint_lock(),
             "Route-SFT collection provenance does not match the sealed 8B source.")
     return m
