@@ -1,11 +1,13 @@
 """Fetch the public Route-SFT pack without credentials or local project files."""
 
+from http.client import IncompleteRead
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
 from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 from .common import ROOT, read_json
@@ -14,6 +16,11 @@ from .sft_export import file_sha256
 
 NAMES = {"manifest.json", "train.jsonl", "batches.jsonl"}
 RELEASE_PAGE = "https://github.com/leiye302/genevolve-2b-rethink-a100-4x/releases"
+CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+
+
+class IncompleteArtifact(ValueError):
+    pass
 
 
 def release_lock():
@@ -36,16 +43,16 @@ def matches(path, spec):
             and path.stat().st_size == spec["bytes"] and file_sha256(path) == spec["sha256"])
 
 
-def copy_bounded(src, dst, size):
+def copy_bounded(src, dst, size, *, append=False):
     remaining = size
-    with dst.open("wb") as file:
+    with dst.open("ab" if append else "wb") as file:
         while chunk := src.read(min(1024**2, remaining + 1)):
             remaining -= len(chunk)
             if remaining < 0:
                 raise ValueError("Route-SFT artifact exceeds its locked size.")
             file.write(chunk)
     if remaining:
-        raise ValueError("Incomplete Route-SFT artifact.")
+        raise IncompleteArtifact("Incomplete Route-SFT artifact.")
 
 
 def verify_files(folder, spec):
@@ -57,23 +64,46 @@ def verify_files(folder, spec):
 
 def download_archive(archive, spec):
     url = f"{RELEASE_PAGE}/download/{spec['tag']}/{spec['name']}"
-    request = Request(url, headers={"User-Agent": "GenEvolve-Route-SFT-Downloader/1.0"})
-    for attempt in range(3):
+    size = spec["bytes"]
+    for attempt in range(5):
+        start = archive.stat().st_size if archive.exists() else 0
+        if start == size:
+            break
+        headers = {"User-Agent": "GenEvolve-Route-SFT-Downloader/1.0", "Accept-Encoding": "identity"}
+        if start:
+            headers["Range"] = f"bytes={start}-"
+        # Avoid replaying a cached redirect or a short CDN response on retry.
+        endpoint = url if attempt == 0 else f"{url}?route_retry={uuid4().hex}"
+        request = Request(endpoint, headers=headers)
         try:
             with urlopen(request, timeout=60) as response:
-                copy_bounded(response, archive, spec["bytes"])
-            break
+                if response.status == 206:
+                    content_range = CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                    if not content_range:
+                        raise ValueError("GitHub returned a partial file without a valid Content-Range.")
+                    first, last, total = map(int, content_range.groups())
+                    if total != size or first != start or not first <= last < total:
+                        raise ValueError("GitHub returned an unexpected Route-SFT byte range.")
+                    copy_bounded(response, archive, last - first + 1, append=start > 0)
+                elif response.status == 200:
+                    # The server may ignore Range; replace the scratch file.
+                    copy_bounded(response, archive, size)
+                else:
+                    raise ValueError(f"Unexpected GitHub download response: HTTP {response.status}.")
+            if archive.stat().st_size == size:
+                break
         except HTTPError as error:
             error.close()
-            if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+            if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 4:
                 raise ValueError(f"Could not download Route-SFT from GitHub (HTTP {error.code}). "
                                  f"Download {spec['name']} from {RELEASE_PAGE}/tag/{spec['tag']} "
                                  "and pass its extracted folder via --data.") from None
-        except (URLError, TimeoutError, ConnectionError):
-            if attempt == 2:
-                raise ValueError("Could not reach GitHub Releases. Download the pinned Route-SFT "
+        except (URLError, TimeoutError, ConnectionError, IncompleteRead, IncompleteArtifact):
+            if attempt == 4:
+                raise ValueError("Could not complete the GitHub download. Download the pinned Route-SFT "
                                  "asset on a connected machine and pass its extracted folder via --data.") from None
-        sleep(attempt + 1)
+        if attempt < 4:
+            sleep(1)
     if not matches(archive, spec):
         raise ValueError("Downloaded Route-SFT archive SHA-256 mismatch.")
 

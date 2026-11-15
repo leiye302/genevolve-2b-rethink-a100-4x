@@ -15,6 +15,13 @@ def entry(blob):
     return {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
 
 
+def response(blob, status=200, headers=None):
+    body = BytesIO(blob)
+    body.status = status
+    body.headers = headers or {}
+    return body
+
+
 class ReleaseTest(unittest.TestCase):
     def setUp(self):
         self.work = Path(self.enterContext(TemporaryDirectory()))
@@ -29,7 +36,7 @@ class ReleaseTest(unittest.TestCase):
         spec = {"tag": "route-sft-test", "name": "route-sft-test.zip", **entry(payload),
                 "files": {name: entry(blob) for name, blob in self.blobs.items()}}
         self.enterContext(patch.object(route_release, "release_lock", return_value=spec))
-        urlopen = self.enterContext(patch.object(route_release, "urlopen", return_value=BytesIO(payload)))
+        urlopen = self.enterContext(patch.object(route_release, "urlopen", return_value=response(payload)))
         return spec, urlopen
 
     def test_anonymous_fetch_reuses_pack_and_detects_corruption(self):
@@ -55,7 +62,7 @@ class ReleaseTest(unittest.TestCase):
 
     def test_corrupt_archive_is_rejected_before_unpacking(self):
         spec, urlopen = self.mock_asset()
-        urlopen.return_value = BytesIO(b"x" * spec["bytes"])
+        urlopen.return_value = response(b"x" * spec["bytes"])
         with self.assertRaisesRegex(ValueError, "archive SHA-256"):
             route_release.prepare_route(self.work)
         self.assertFalse((self.work / "route_data" / spec["tag"]).exists())
@@ -68,6 +75,30 @@ class ReleaseTest(unittest.TestCase):
             path = route_release.prepare_route(self.work)
         self.assertTrue(path.is_dir())
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_continues_short_response_with_valid_range(self):
+        spec, urlopen = self.mock_asset()
+        payload = urlopen.return_value.getvalue()
+        cut = len(payload) // 2
+        urlopen.side_effect = [response(payload[:cut]),
+                               response(payload[cut:], 206,
+                                        {"Content-Range": f"bytes {cut}-{len(payload)-1}/{len(payload)}"})]
+        with patch.object(route_release, "sleep"):
+            path = route_release.prepare_route(self.work)
+        self.assertEqual(path, self.work / "route_data" / spec["tag"])
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(urlopen.call_args.args[0].get_header("Range"), f"bytes={cut}-")
+
+    def test_range_offset_mismatch_cannot_publish_partial_data(self):
+        spec, urlopen = self.mock_asset()
+        payload = urlopen.return_value.getvalue()
+        cut = len(payload) // 2
+        urlopen.side_effect = [response(payload[:cut]),
+                               response(payload[cut:], 206,
+                                        {"Content-Range": f"bytes 0-{len(payload)-1}/{len(payload)}"})]
+        with patch.object(route_release, "sleep"), self.assertRaisesRegex(ValueError, "unexpected .*range"):
+            route_release.prepare_route(self.work)
+        self.assertFalse((self.work / "route_data" / spec["tag"]).exists())
 
     def test_404_reports_download_option_without_partial_data(self):
         spec, urlopen = self.mock_asset()
