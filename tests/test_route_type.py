@@ -66,7 +66,8 @@ class RouteTypeTest(unittest.TestCase):
         cfg = recipe()
         self.assertEqual((cfg['type_lambda'], cfg['type_objective']), (0.1, TYPE_OBJECTIVE))
         self.assertEqual((cfg['route_lambda'], cfg['reference_kl_coef']), (0.1, 0.0))
-        self.assertEqual((cfg['good_per_batch'], cfg['bad_per_batch'], cfg['epochs']), (6, 2, 2))
+        self.assertEqual((cfg['good_per_batch'], cfg['bad_per_batch'], cfg['epochs']), (6, 2, 1))
+        self.assertEqual(cfg['batches_per_epoch'] * cfg['epochs'], 297)
         self.assertEqual((cfg['lr'], cfg['loss_reduction']), (2e-6, 'sample_mean'))
         for weight in (-0.1, float('inf'), float('nan'), True):
             with self.assertRaises(ValueError):
