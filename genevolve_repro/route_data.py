@@ -7,7 +7,8 @@ import re
 from .actor_text import ACTOR_TEXT_PROTOCOL, decode_actor_response
 from .common import ROOT, jsonl, read_json
 from .route_release import release_lock
-from .route_type import action_boundary, validate_type_config, validate_type_tokenizer
+from .route_type import action_boundary, validate_type_tokenizer
+from .route_objective import validate_objective
 from .sft_export import MODEL_FAMILY, REQUIRED, file_sha256, sft_manifest
 
 MARKER = "<RETHINK>"
@@ -17,7 +18,9 @@ EOS_ID = 151645
 
 def recipe():
     cfg = read_json(ROOT / "configs" / "route_sft.json")
-    validate_type_config(cfg)
+    validate_objective(cfg)
+    from .marker_seed import validate_seed_config
+    validate_seed_config(cfg["marker_initialization"])
     return cfg
 
 
@@ -154,9 +157,9 @@ def register_marker(tokenizer):
     require(tokenizer.eos_token_id == EOS_ID, "Unexpected original EOS.")
     added = tokenizer.add_special_tokens({"additional_special_tokens": [MARKER]},
                                          replace_additional_special_tokens=False)
-    require(added == 1 and tokenizer.encode(MARKER, add_special_tokens=False) == [MARKER_ID]
+    require(added in (0, 1) and tokenizer.encode(MARKER, add_special_tokens=False) == [MARKER_ID]
             and MARKER_ID in tokenizer.all_special_ids,
-            "Expected one newly registered marker in the checkpoint's reserved vocabulary slots.")
+            "Expected the marker registered at the checkpoint's reserved vocabulary slot.")
     return tokenizer
 
 

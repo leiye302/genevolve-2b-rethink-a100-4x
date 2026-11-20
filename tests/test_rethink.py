@@ -80,16 +80,17 @@ class RethinkTest(unittest.TestCase):
     def test_route_mean_ce_and_full_vocabulary_bce_use_the_predictive_index(self):
         torch.manual_seed(0)
         model = ToyPolicy()
-        scorer = RouteScorer(model, projection_chunk=2)
+        scorer = RouteScorer(model, projection_chunk=2, type_tokens=(8, 5, 6))
         # The first trainable target is marker 7 at offset 3. Earlier IDs
         # condition the suffix but must not contribute additional CE terms.
         ids = torch.tensor([[4, 1, 9, 7, 8, 10, 2]])
         lam = recipe()["route_lambda"]
-        loss, ce, bce, p = scorer(ids, 3, 1, 7, lam)
+        loss, ce, bce, p = scorer(ids, 3, 1, 7, lam, tag_end=5)
         logits = model.lm_head(model.model(ids).last_hidden_state[0])
         expected_ce = F.cross_entropy(logits[2:-1], ids[0, 3:])
         expected_p = logits[2].softmax(0)[7]
-        expected = expected_ce - lam * expected_p.log()
+        tokens_ce = F.cross_entropy(logits[2:-1], ids[0, 3:], reduction='none')
+        expected = .15 * tokens_ce[[0, 2, 3]].mean() + .5 * tokens_ce[1] - lam * expected_p.log()
         torch.testing.assert_close(loss, expected)
         torch.testing.assert_close(ce, expected_ce.detach())
         torch.testing.assert_close(bce, -expected_p.detach().log())
@@ -352,7 +353,7 @@ class RethinkTest(unittest.TestCase):
                                                       "contract": {**identity, "config": saved_cfg}})
                 with self.assertRaisesRegex(ValueError, "configured epoch count"):
                     verify_route_export(path)
-            old_cfg = {k: v for k, v in cfg.items() if k not in ("type_lambda", "type_objective")}
+            old_cfg = {k: v for k, v in cfg.items() if k not in ("marker_initialization", "ce_objective")}
             write_json(path / "completed.json", {"step": 297, "algorithm": "route-sft",
                                                   "contract": {**identity, "config": old_cfg}})
             with self.assertRaisesRegex(ValueError, "configured epoch count"):

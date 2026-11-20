@@ -1,6 +1,7 @@
 """Four-rank Qwen3-VL-2B Route-SFT on the reviewed v3 examples."""
 
 from contextlib import nullcontext
+from functools import partial
 import random
 from statistics import fmean
 
@@ -21,7 +22,9 @@ from .route_data import (
     verify_parent_identity, verify_tokenizer,
 )
 from .sft_export import sft_manifest
-from .route_type import TYPE_TOKENS, action_boundary, action_type_bce
+from .route_type import TYPE_TOKENS, action_boundary
+from .route_objective import split_ce, supervision_layout
+from .marker_seed import apply_marker_seed, prepare_marker_seed
 
 
 def route_bce(logits, marker_id, is_bad):
@@ -32,51 +35,38 @@ def route_bce(logits, marker_id, is_bad):
 
 
 class RouteScorer(ActorScorer):
-    def __init__(self, model, projection_chunk=128, type_tokens=TYPE_TOKENS):
+    def __init__(self, model, projection_chunk=128, type_tokens=TYPE_TOKENS, initial_marker=None):
         super().__init__(model, projection_chunk)
         self.type_tokens = type_tokens
+        if initial_marker is not None:
+            apply_marker_seed(model, initial_marker, MARKER_ID)
 
     def forward(self, input_ids, start, is_bad, marker_id, route_lambda,
-                type_lambda=0.0, with_type_metrics=False):
+                *, tag_end=None, kind_weight=1.0, content_weight=0.15,
+                tag_weight=0.5, with_metrics=False):
         hidden = self.model.model(input_ids=input_ids, use_cache=False, return_dict=True)
         # Only the supervised token predictors are projected. H/R remain in
         # the attention context; no CE is imposed on their token positions.
         states = hidden.last_hidden_state[0, start - 1:-1]
         targets = input_ids[0, start:]
 
-        def ce_sum(state, ids):
-            return F.cross_entropy(self.model.lm_head(state).float(), ids, reduction="sum")
+        def ce_tokens(state, ids):
+            return F.cross_entropy(self.model.lm_head(state).float(), ids, reduction="none")
 
-        parts = [checkpoint(ce_sum, chunk, ids, use_reentrant=False) if torch.is_grad_enabled()
-                 else ce_sum(chunk, ids)
+        parts = [checkpoint(ce_tokens, chunk, ids, use_reentrant=False) if torch.is_grad_enabled()
+                 else ce_tokens(chunk, ids)
                  for chunk, ids in zip(states.split(self.projection_chunk), targets.split(self.projection_chunk))]
-        ce = torch.stack(parts).sum() / len(targets)
+        token_ce = torch.cat(parts)
+        ce = token_ce.mean()  # Original suffix mean, retained as a diagnostic only.
         bce, probability = route_bce(self.model.lm_head(states[0]), marker_id, is_bad)
-        loss = ce + route_lambda * bce
-        type_metrics = {key: ce.detach().new_zeros(()) for key in (
-            "type_bce", "tool_bce", "answer_bce", "p_tool", "p_answer",
-        )}
-        if type_lambda:
-            action_start, is_answer = action_boundary(
-                input_ids[0], start, is_bad, marker_id, self.type_tokens,
-            )
-            # This state predicts the *first* action token. For Bad it is after
-            # the optional marker, never after a teacher-forced action token.
-            action_logits = self.model.lm_head(states[action_start - start])
-            # Always replay s + '<', on EVERY rank and for BOTH target types.
-            # A label-dependent extra forward would desynchronize FSDP. The
-            # candidate sees no action token/body from the supervised target.
-            # Keep gradients through this replay; detaching changes the loss.
-            prefix = torch.cat((input_ids[:, :action_start],
-                                input_ids.new_tensor([[self.type_tokens[1]]])), dim=1)
-            candidate = self.model.model(input_ids=prefix, use_cache=False, return_dict=True)
-            after_opening_logits = self.model.lm_head(candidate.last_hidden_state[0, -1])
-            type_loss, type_metrics = action_type_bce(
-                action_logits, after_opening_logits, is_answer, self.type_tokens,
-            )
-            loss = loss + type_lambda * type_loss
+        if tag_end is None:
+            raise ValueError("Pass the tokenizer-verified action_tag_end; do not guess a tag span.")
+        action_start, _ = action_boundary(input_ids[0], start, is_bad, marker_id, self.type_tokens)
+        weighted_ce, metrics = split_ce(token_ce, action_start - start, tag_end - start,
+                                        kind_weight, content_weight, tag_weight)
+        loss = weighted_ce + route_lambda * bce
         result = (loss, ce.detach(), bce.detach(), probability.detach())
-        return (*result, type_metrics) if with_type_metrics else result
+        return (*result, metrics) if with_metrics else result
 
 
 def update(actor, optimizer, rows, batch, cfg, rank, size, device):
@@ -90,9 +80,11 @@ def update(actor, optimizer, rows, batch, cfg, rank, size, device):
         ctx = actor.no_sync() if hasattr(actor, "no_sync") and i + 1 < len(batch_local) else nullcontext()
         with ctx:
             ids = torch.tensor([row["input_ids"]], device=device, dtype=torch.long)
-            loss, ce, bce, p, type_stats = actor(
+            loss, ce, bce, p, ce_stats = actor(
                 ids, row["target_start"], row["route_label"], MARKER_ID, cfg["route_lambda"],
-                type_lambda=cfg["type_lambda"], with_type_metrics=True,
+                tag_end=row["action_tag_end"], kind_weight=row["action_kind_weight"],
+                content_weight=cfg["content_ce_weight"], tag_weight=cfg["action_tag_ce_weight"],
+                with_metrics=True,
             )
             finite = torch.isfinite(loss.detach()).int()
             if dist.is_initialized():
@@ -106,7 +98,7 @@ def update(actor, optimizer, rows, batch, cfg, rank, size, device):
         stats.append({"route_label": row["route_label"], "is_answer": is_answer,
                       "loss": loss.detach().item(), "suffix_ce": ce.item(),
                       "route_bce": bce.item(), "p_rethink": p.item(),
-                      **{key: value.item() for key, value in type_stats.items()}})
+                      **{key: value.item() for key, value in ce_stats.items()}})
     clip = getattr(actor, "clip_grad_norm_", None)
     norm = clip(cfg["clip_grad"]) if clip else torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg["clip_grad"])
     if not torch.isfinite(norm).item():
@@ -118,22 +110,17 @@ def update(actor, optimizer, rows, batch, cfg, rank, size, device):
 def summarize_losses(flat, cfg):
     """One global sample mean, after rank gathering; never divide by B twice."""
     metrics = {key: fmean(x[key] for x in flat) for key in (
-        "loss", "suffix_ce", "route_bce", "type_bce", "tool_bce", "answer_bce",
-        "p_tool", "p_answer",
+        "loss", "suffix_ce", "route_bce", "content_ce", "action_tag_ce",
+        "content_weighted", "action_tag_weighted", "weighted_ce",
     )}
     metrics["route_weighted"] = cfg["route_lambda"] * metrics["route_bce"]
-    metrics["type_weighted"] = cfg["type_lambda"] * metrics["type_bce"]
     for label, name in ((0, "good"), (1, "bad")):
         values = [x["p_rethink"] for x in flat if x["route_label"] == label]
         metrics[f"{name}_p_rethink"] = fmean(values) if values else None
     for is_answer, name in ((False, "tool"), (True, "answer")):
         items = [x for x in flat if x["is_answer"] == is_answer]
         metrics[f"target_{name}_count"] = len(items)
-        # Not free-generation accuracy; useful to distinguish both-small from
-        # confident type probabilities without another renormalization.
-        metrics[f"target_{name}_mean_probability"] = (
-            fmean(x[f"p_{name}"] for x in items) if items and cfg["type_lambda"] else None
-        )
+        metrics[f"target_{name}_tag_ce"] = fmean(x["action_tag_ce"] for x in items) if items else None
     return metrics
 
 
@@ -195,9 +182,14 @@ def _loop(work, parent, data, rank, size, device):
     rows, batches = load_pack(data, cfg, m)
     # The pack was captured by 8B. Replay its exact IDs only after checking
     # the actual 2B training parent's tokenizer, not just the public base.
+    layout = None
     if rank == 0:
-        verify_tokenizer(rows, parent_tokenizer(parent))
-    barrier()
+        tokenizer = parent_tokenizer(parent)
+        verify_tokenizer(rows, tokenizer)
+        layout = supervision_layout(rows, tokenizer, MARKER_ID)
+    layout = gather(layout)[0]
+    for row, metadata in zip(rows, layout):
+        row.update(metadata)
     contract = route_identity(data, m, cfg, parent_id)
     out = work / "route_sft"
     if rank == 0:
@@ -217,7 +209,12 @@ def _loop(work, parent, data, rank, size, device):
         raise ValueError("Expected a complete epoch checkpoint.")
     random.seed(cfg["seed"] + rank)
     torch.manual_seed(cfg["seed"] + rank)
-    actor = make_sharded_actor(parent, device, saved["actor"] if saved else None, scorer_type=RouteScorer)
+    seed = prepare_marker_seed(out, parent, rows, contract, MARKER_ID, rank, size, device, resume=bool(saved))
+    random.seed(cfg["seed"] + rank)
+    torch.manual_seed(cfg["seed"] + rank)
+    # Saved model/optimizer states always win: never reseed a resumed Actor.
+    scorer = partial(RouteScorer, initial_marker=seed if saved is None else None)
+    actor = make_sharded_actor(parent, device, saved["actor"] if saved else None, scorer_type=scorer)
     optimizer = torch.optim.AdamW((p for p in actor.parameters() if p.requires_grad),
                                   lr=cfg["lr"], betas=cfg["betas"], weight_decay=cfg["weight_decay"],
                                   foreach=False)
@@ -241,7 +238,7 @@ def _loop(work, parent, data, rank, size, device):
             flat = [x for local in stats for x in local]
             metrics = {"step": step, "epoch": (index // len(batches)) + 1,
                        "lr": scheduler.get_last_lr()[0], "grad_norm": norm,
-                       "type_enabled": bool(cfg["type_lambda"]),
+                       "ce_objective": cfg["ce_objective"],
                        **summarize_losses(flat, cfg)}
             write_json(out / "metrics" / f"step-{step:05d}.json", metrics)
             if step == 1 or step % 5 == 0 or step % len(batches) == 0:

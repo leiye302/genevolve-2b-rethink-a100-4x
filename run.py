@@ -190,6 +190,7 @@ def main():
         from genevolve_repro.route_data import (
             load_pack, pack_manifest, parent_tokenizer, recipe, verify_parent, verify_tokenizer,
         )
+        from genevolve_repro.route_objective import supervision_layout
 
         cfg = recipe()
         try:
@@ -197,7 +198,9 @@ def main():
             data = route_data_folder(work, args.data)
             m = pack_manifest(data, cfg)
             rows, batches = load_pack(data, cfg, m)
-            verify_tokenizer(rows, parent_tokenizer(args.parent.resolve()))
+            tokenizer = parent_tokenizer(args.parent.resolve())
+            verify_tokenizer(rows, tokenizer)
+            supervision_layout(rows, tokenizer, 151669)
             print(json.dumps({"parent": parent, "trajectory_source": "8B", "route_data": str(data),
                               "route_data_variant": m.get("release_variant", "reviewed-v3-original"),
                               "route_manifest_sha256": file_sha256(data / "manifest.json"),

@@ -25,11 +25,12 @@
 
 **数据来源与训练起点不同。** 复审 v3 数据的离线轨迹由 GenEvolve 8B 采集；本实验从 2B SFT-550 训练。默认使用[公开版训练包](DATASET.md)：只脱敏历史工具响应中的机器路径、访问参数和联系方式，重新计算受影响的历史 token 与边界。样本、批序、当前 reasoning 和受监督 token 不变。启动时用实际 2B SFT-550 tokenizer 核对全部历史 token、边界和解码；若不一致就报错，不临时重分词或跳过样本。
 
-- mask 至 `</think>\n`（含分隔符），保留原来的逐样本平均后缀 CE（含 Bad marker、动作及 EOS）和 **0.1 × 全词表 marker BCE**。新增 **0.1 × (Tool-call BCE + Answer BCE) / 2**：在动作开始前按真实目标类型监督，Good/Bad 权重相同，不按正文长度缩放；无 reasoning CE、无 KL、无 LoRA。精确定义、两 token Answer 前缀和因果评分见 [动作类型 BCE](docs/ACTION_TYPE_BCE.md)。
+- 训练前冻结 SFT-550，用训练样本的 H/R 决策状态**只校准 `<RETHINK>` 的共享 embedding/LM-head 行**，不改其他父模型参数。使用 BCE（校准期 `pos_weight=0.5`）＋ridge 0.01；自动缓存并记录来源，正常 SFT 续训不再次初始化。
+- mask 至 `</think>\n`（含分隔符）；将真实动作起始标签与其余后缀分开：**0.15 × 内容 CE ＋ 0.5 × 类型均衡权重 × 标签 CE ＋ 0.1 × 全词表 marker BCE**。类型权重从全库统计，Answer 约 1.913、Tool 约 0.677；正文、Bad marker 和 EOS 仍有 CE。**本版不再叠加 tool/answer type BCE**。无 reasoning CE、无 KL、无 LoRA。完整公式、校准实现细节及合并 token 的处理见 [两项改动说明](docs/MARKER_AND_TAG_CE.md)。
 - 按原序扫描 297 个固定批次一遍：全局 8，四卡 × micro 1 × 累积 2，**1 epoch / 297 updates**。LR 2e-6，前 10% warmup、cosine、AdamW (0.9, 0.95)、weight decay 0.01、clip 1.0、seed 0。语言参数全参训练，视觉塔不动。
 - 公开包最长 11,081 tokens（原档 11,223）；使用 12,288 上限，超长直接报错，不现场重分词或截断。每轮存原生可续训状态和 HF 导出。该封版包只供训练，没有另造 SFT val split；日志中的 train loss 和给定前缀 marker 概率不是自由生成指标。
 
-**本版是新增 type BCE 的单变量配方，不是其他多项改动的实验配方。** 请从同一 SFT-550 使用新的 `WORK` 重跑，不能把旧的无 type-BCE 断点当成本版断点续训或直接接二阶段。仅设 `type_lambda=0.0` 可做原损失对照，仍需另一个新 `WORK`。新增项需要每个样本额外一次可导的候选前缀评分，四卡 GPU 的耗时、显存与实际质量需预检，不宣称已经实测。
+**本版仅采用 marker 初始化＋均衡标签 CE 两项修正。** 请从同一 SFT-550 使用新的 `WORK` 重跑，不能接续旧 type-BCE 或多项修复版本的断点。没有加入 Good KL、额外语言层冻结、条件 route BCE、推理期 marker 限制或历史改写。初始化额外扫描一遍冻结父模型的训练前缀，正常 SFT 每样本仍只做一次前向。原报告未公开的拟合优化器、初始向量混合及内部划分细节已在文档中明确固定，不能声称逐字复现其私有补丁或沿用其成绩。四卡 GPU 耗时、显存与实际质量尚需实测。
 
 ## 二阶段：GenEvolve GRPO + SDL，Actor 路由局部 hint
 
@@ -82,7 +83,7 @@ python run.py --work "$WORK" eval --split bench
 
 只训练一阶段时，可单独执行 `python run.py --work "$WORK" route-sft --parent "$PARENT"`，无需 API；手动接二阶段时先执行 `python run.py --work "$WORK" prepare`，再执行 `python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00297"`。二阶段入口自动准备固定版本的 Qwen3-Embedding-0.6B，也可用 `prepare-embedding` 提前下载。重新执行 `all` 会复用已验收的数据和一阶段最终导出；若一阶段尚未结束，则从已保存的 epoch 断点续训。任何一阶段报错或导出校验失败均不会开二阶段。
 
-同 2B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，不调用 hint API；不带 RETHINK 的 GenEvolve 对照请用独立的 2B 复现仓库。原冷启动和 Route-SFT 一轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启使用原命令、同一 WORK、数据、起点、计划步数与服务配置；二阶段断点保存原版经验库。旧版 SDAR 二阶段断点不能接续到这版；Route-SFT 导出必须匹配当前完整训练合同（含 type BCE 配方）。不要把 8B 的断点用于 2B。
+同 2B 纯 GRPO 对照可用本仓库的 `grpo --sft-checkpoint "$PARENT"`，不调用 hint API；不带 RETHINK 的 GenEvolve 对照请用独立的 2B 复现仓库。原冷启动和 Route-SFT 一轮的 HF 模型可复用同一 `eval --policy ... --split bench`；小规模试测可用 `--max-cases N`，不应混入正式终评。重启使用原命令、同一 WORK、数据、起点、计划步数与服务配置；二阶段断点保存原版经验库。旧版 SDAR 二阶段断点不能接续到这版；Route-SFT 导出必须匹配当前完整训练合同（含 marker 初始化和标签 CE 配方）。不要把 8B 的断点用于 2B。
 
 **单轮更新：**一阶段在 297 步保存可续训状态及 `hf-step-00297`，二阶段自动接此导出。数据、损失及其他参数不变；cosine 总步数随单轮改为 297，warmup 仍按 10% 取整。请从同一 SFT-550 起点使用新的 `WORK`；旧两轮计划的 297 步权重使用的是不同调度，不能冒充这版单轮结果，旧 594 步导出也不会被自动接入。
 
@@ -95,6 +96,9 @@ bash scripts/setup.sh --sources-only
 python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements-smoke.txt
 python -m unittest discover -s tests -v
+# 可选：匿名下载训练包与 tokenizer，逐条核对后用随机小 Qwen 做一次真实梯度更新。
+# 不下载 2B 权重，不调用 API；不能替代实际 SFT-550 或 GPU 验收。
+python scripts/check_route_cpu.py --work /path/to/empty-cpu-check
 ```
 
 离线检查以 mock 工具、Judge、hint 覆盖 rollout、解码、Teacher 输入、梯度和断点写入。真实 GPU 训练、API 质量和图像评分需在目标机验证。
