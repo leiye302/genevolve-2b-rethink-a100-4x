@@ -13,6 +13,8 @@
   "loss_reduction": "sample_mean",
   "suffix_ce_weight": 1.0,
   "route_lambda": 0.1,
+  "type_lambda": 0.1,
+  "type_objective": "native_prefix_one_vs_rest_v1",
   "reference_kl_coef": 0.0,
   "seed": 0,
   "lr": 0.000002,

@@ -345,6 +345,12 @@ class RethinkTest(unittest.TestCase):
             write_json(path / "completed.json", {"step": 594, "algorithm": "route-sft", "contract": identity})
             write_json(path / "export_sha256.json", sft_manifest(path))
             self.assertEqual(verify_route_export(path, expected_contract=identity)["completed"]["step"], 594)
+            old_cfg = {k: v for k, v in cfg.items() if k not in ("type_lambda", "type_objective")}
+            write_json(path / "completed.json", {"step": 594, "algorithm": "route-sft",
+                                                  "contract": {**identity, "config": old_cfg}})
+            with self.assertRaisesRegex(ValueError, "two-epoch"):
+                verify_route_export(path)
+            write_json(path / "completed.json", {"step": 594, "algorithm": "route-sft", "contract": identity})
             (parent / "model.safetensors").write_bytes(b"a different step 550 export")
             with self.assertRaisesRegex(ValueError, "supplied 2B parent"):
                 verify_route_export(path, expected_contract={**identity, "parent": verify_parent(parent)})

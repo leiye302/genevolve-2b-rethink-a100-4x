@@ -7,6 +7,7 @@ import re
 from .actor_text import ACTOR_TEXT_PROTOCOL, decode_actor_response
 from .common import ROOT, jsonl, read_json
 from .route_release import release_lock
+from .route_type import action_boundary, validate_type_config, validate_type_tokenizer
 from .sft_export import MODEL_FAMILY, REQUIRED, file_sha256, sft_manifest
 
 MARKER = "<RETHINK>"
@@ -15,7 +16,9 @@ EOS_ID = 151645
 
 
 def recipe():
-    return read_json(ROOT / "configs" / "route_sft.json")
+    cfg = read_json(ROOT / "configs" / "route_sft.json")
+    validate_type_config(cfg)
+    return cfg
 
 
 def require(condition, message):
@@ -112,6 +115,10 @@ def load_pack(folder, cfg, manifest=None):
         require(row["assistant_prefix"].endswith("</think>\n") and MARKER not in row["assistant_prefix"]
                 and row["target"].startswith(MARKER) == bool(label),
                 f"Invalid assistant/target split at row {index}.")
+        _, is_answer = action_boundary(ids, start, label, MARKER_ID)
+        text = row["target"][len(MARKER):] if label else row["target"]
+        require(text.startswith("<answer>" if is_answer else "<tool_call>"),
+                f"Action text and token-prefix labels disagree at row {index}.")
         rows.append(row)
         ids_seen.add(uid)
         labels_seen[label] += 1
@@ -156,6 +163,8 @@ def register_marker(tokenizer):
 def verify_tokenizer(rows, tokenizer):
     """Compare the online chat template and decode boundary, not just the stored labels."""
     from .policy import tokenize_history
+
+    validate_type_tokenizer(tokenizer)
 
     class DecodeView:
         # The shared decoder does not modify the tokenizer. Cache its vocabulary

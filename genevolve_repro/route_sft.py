@@ -21,6 +21,7 @@ from .route_data import (
     verify_parent_identity, verify_tokenizer,
 )
 from .sft_export import sft_manifest
+from .route_type import TYPE_TOKENS, action_boundary, action_type_bce
 
 
 def route_bce(logits, marker_id, is_bad):
@@ -31,7 +32,12 @@ def route_bce(logits, marker_id, is_bad):
 
 
 class RouteScorer(ActorScorer):
-    def forward(self, input_ids, start, is_bad, marker_id, route_lambda):
+    def __init__(self, model, projection_chunk=128, type_tokens=TYPE_TOKENS):
+        super().__init__(model, projection_chunk)
+        self.type_tokens = type_tokens
+
+    def forward(self, input_ids, start, is_bad, marker_id, route_lambda,
+                type_lambda=0.0, with_type_metrics=False):
         hidden = self.model.model(input_ids=input_ids, use_cache=False, return_dict=True)
         # Only the supervised token predictors are projected. H/R remain in
         # the attention context; no CE is imposed on their token positions.
@@ -46,7 +52,31 @@ class RouteScorer(ActorScorer):
                  for chunk, ids in zip(states.split(self.projection_chunk), targets.split(self.projection_chunk))]
         ce = torch.stack(parts).sum() / len(targets)
         bce, probability = route_bce(self.model.lm_head(states[0]), marker_id, is_bad)
-        return ce + route_lambda * bce, ce.detach(), bce.detach(), probability.detach()
+        loss = ce + route_lambda * bce
+        type_metrics = {key: ce.detach().new_zeros(()) for key in (
+            "type_bce", "tool_bce", "answer_bce", "p_tool", "p_answer",
+        )}
+        if type_lambda:
+            action_start, is_answer = action_boundary(
+                input_ids[0], start, is_bad, marker_id, self.type_tokens,
+            )
+            # This state predicts the *first* action token. For Bad it is after
+            # the optional marker, never after a teacher-forced action token.
+            action_logits = self.model.lm_head(states[action_start - start])
+            # Always replay s + '<', on EVERY rank and for BOTH target types.
+            # A label-dependent extra forward would desynchronize FSDP. The
+            # candidate sees no action token/body from the supervised target.
+            # Keep gradients through this replay; detaching changes the loss.
+            prefix = torch.cat((input_ids[:, :action_start],
+                                input_ids.new_tensor([[self.type_tokens[1]]])), dim=1)
+            candidate = self.model.model(input_ids=prefix, use_cache=False, return_dict=True)
+            after_opening_logits = self.model.lm_head(candidate.last_hidden_state[0, -1])
+            type_loss, type_metrics = action_type_bce(
+                action_logits, after_opening_logits, is_answer, self.type_tokens,
+            )
+            loss = loss + type_lambda * type_loss
+        result = (loss, ce.detach(), bce.detach(), probability.detach())
+        return (*result, type_metrics) if with_type_metrics else result
 
 
 def update(actor, optimizer, rows, batch, cfg, rank, size, device):
@@ -60,7 +90,10 @@ def update(actor, optimizer, rows, batch, cfg, rank, size, device):
         ctx = actor.no_sync() if hasattr(actor, "no_sync") and i + 1 < len(batch_local) else nullcontext()
         with ctx:
             ids = torch.tensor([row["input_ids"]], device=device, dtype=torch.long)
-            loss, ce, bce, p = actor(ids, row["target_start"], row["route_label"], MARKER_ID, cfg["route_lambda"])
+            loss, ce, bce, p, type_stats = actor(
+                ids, row["target_start"], row["route_label"], MARKER_ID, cfg["route_lambda"],
+                type_lambda=cfg["type_lambda"], with_type_metrics=True,
+            )
             finite = torch.isfinite(loss.detach()).int()
             if dist.is_initialized():
                 dist.all_reduce(finite, op=dist.ReduceOp.MIN)
@@ -68,13 +101,40 @@ def update(actor, optimizer, rows, batch, cfg, rank, size, device):
                 raise FloatingPointError("Non-finite Route-SFT loss; the last saved epoch is unchanged.")
             # FSDP averages across ranks, each rank contributes two rows.
             (loss / len(batch_local)).backward()
-        stats.append((row["route_label"], loss.detach().item(), ce.item(), bce.item(), p.item()))
+        _, is_answer = action_boundary(row["input_ids"], row["target_start"],
+                                       row["route_label"], MARKER_ID)
+        stats.append({"route_label": row["route_label"], "is_answer": is_answer,
+                      "loss": loss.detach().item(), "suffix_ce": ce.item(),
+                      "route_bce": bce.item(), "p_rethink": p.item(),
+                      **{key: value.item() for key, value in type_stats.items()}})
     clip = getattr(actor, "clip_grad_norm_", None)
     norm = clip(cfg["clip_grad"]) if clip else torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg["clip_grad"])
     if not torch.isfinite(norm).item():
         raise FloatingPointError("Non-finite Route-SFT gradient; the last saved epoch is unchanged.")
     optimizer.step()
     return stats, float(norm)
+
+
+def summarize_losses(flat, cfg):
+    """One global sample mean, after rank gathering; never divide by B twice."""
+    metrics = {key: fmean(x[key] for x in flat) for key in (
+        "loss", "suffix_ce", "route_bce", "type_bce", "tool_bce", "answer_bce",
+        "p_tool", "p_answer",
+    )}
+    metrics["route_weighted"] = cfg["route_lambda"] * metrics["route_bce"]
+    metrics["type_weighted"] = cfg["type_lambda"] * metrics["type_bce"]
+    for label, name in ((0, "good"), (1, "bad")):
+        values = [x["p_rethink"] for x in flat if x["route_label"] == label]
+        metrics[f"{name}_p_rethink"] = fmean(values) if values else None
+    for is_answer, name in ((False, "tool"), (True, "answer")):
+        items = [x for x in flat if x["is_answer"] == is_answer]
+        metrics[f"target_{name}_count"] = len(items)
+        # Not free-generation accuracy; useful to distinguish both-small from
+        # confident type probabilities without another renormalization.
+        metrics[f"target_{name}_mean_probability"] = (
+            fmean(x[f"p_{name}"] for x in items) if items and cfg["type_lambda"] else None
+        )
+    return metrics
 
 
 def run_epoch_export(out, step, actor, parent, rank, contract):
@@ -181,10 +241,8 @@ def _loop(work, parent, data, rank, size, device):
             flat = [x for local in stats for x in local]
             metrics = {"step": step, "epoch": (index // len(batches)) + 1,
                        "lr": scheduler.get_last_lr()[0], "grad_norm": norm,
-                       "loss": fmean(x[1] for x in flat), "suffix_ce": fmean(x[2] for x in flat),
-                       "route_bce": fmean(x[3] for x in flat),
-                       "good_p_rethink": fmean(x[4] for x in flat if x[0] == 0),
-                       "bad_p_rethink": fmean(x[4] for x in flat if x[0] == 1)}
+                       "type_enabled": bool(cfg["type_lambda"]),
+                       **summarize_losses(flat, cfg)}
             write_json(out / "metrics" / f"step-{step:05d}.json", metrics)
             if step == 1 or step % 5 == 0 or step % len(batches) == 0:
                 print(metrics, flush=True)
